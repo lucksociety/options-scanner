@@ -332,7 +332,7 @@ def stage2(top, side):
     for i, x in enumerate(top):
         out.append(deep(x, side)); time.sleep(0.4)
         if i % 10 == 9: log.info("deep %d/%d", i + 1, len(top))
-    out.sort(key=lambda o: -o["score"])
+    out.sort(key=lambda o: (0 if o.get("play") else 1, -o["score"]))   # names with a real contract rank first
     return out
 
 def _clean(v):
