@@ -21,7 +21,7 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -30,7 +30,7 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - name: Run scanner
-        run: python scanner/scan.py "${{ inputs.mode || 'auto' }}"
+        run: python scanner/scan.py "${{ inputs.mode || 'auto' }}" both
       - name: Publish results
         run: |
           if [ -n "$(git status --porcelain data)" ]; then
@@ -43,3 +43,4 @@ jobs:
           else
             echo "no new results"
           fi
+
