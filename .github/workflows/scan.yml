@@ -1,0 +1,80 @@
+name: Luck Society Option Scanner
+
+on:
+  schedule:
+    # Every 5 minutes, 12:00–21:59 UTC on weekdays. The script itself only works between
+    # 08:25 and 16:10 New York time (handles EDT/EST), so off-hours firings exit immediately.
+    - cron: "*/5 12-21 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full = re-run the Finviz screen + deep scan; refresh = re-quote current names; auto = decide by time of day"
+        type: choice
+        default: full
+        options: [full, refresh, auto]
+
+concurrency:
+  group: scan
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run scanner
+        id: run
+        env:
+          PAGES_DATA_URL: https://raw.githubusercontent.com/${{ github.repository }}/main/data/latest.json
+        run: |
+          python scanner/scan.py "${{ github.event.inputs.mode || 'auto' }}"
+          if [ -f data/latest.json ]; then echo "changed=true" >> "$GITHUB_OUTPUT"; else echo "changed=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Save results to the repo (keeps the page working even without Actions-based Pages)
+        if: steps.run.outputs.changed == 'true'
+        run: |
+          if [ -n "$(git status --porcelain data)" ]; then
+            git config user.name "luck-society-scanner-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git add data
+            git commit -m "scan: $(date -u '+%F %H:%M') UTC"
+            git pull --rebase
+            git push
+          fi
+
+      - name: Turn on GitHub Pages (Actions source) if it isn't already
+        if: steps.run.outputs.changed == 'true'
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Bundle the site
+        if: steps.run.outputs.changed == 'true'
+        run: |
+          mkdir -p _site && cp -r index.html assets data _site/
+
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.run.outputs.changed == 'true'
+        with:
+          path: _site
+
+      - uses: actions/deploy-pages@v4
+        if: steps.run.outputs.changed == 'true'
+        id: deploy
