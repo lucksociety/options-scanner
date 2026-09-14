@@ -35,8 +35,8 @@ SEC_UA = {"User-Agent": "LuckSocietyOptionScanner/1.0 (github.com/lucksociety/op
 CFG = {
     "calls": dict(price_min=1.0, price_max=10.0, si_min=15.0, avgvol_min=300_000, deep_n=40,
                   min_dte=14, max_dte=45, max_ask=0.25, min_oi=25, max_be=60.0),
-    "puts":  dict(price_min=5.0, price_max=30.0, si_max=15.0, avgvol_min=500_000, deep_n=40,
-                  run5_min=20.0, run10_min=35.0, ext20_min=25.0, rsi_hot=68.0,       # "ran too far" triggers (any one)
+    "puts":  dict(price_min=3.0, price_max=50.0, si_max=15.0, avgvol_min=500_000, deep_n=40,
+                  run5_min=15.0, run10_min=25.0, ext20_min=20.0, gap_min=12.0,       # "ran too far" triggers (any one) — RSI alone is NOT a ticket in
                   min_dte=21, max_dte=45, max_ask=0.35, min_oi=25, max_be=35.0),
 }
 
@@ -176,13 +176,18 @@ def stage1_puts():
             sma = lambda n: round((p / float(cl[-n:].mean()) - 1) * 100, 2) if len(cl) >= n else None
             rs = rsi_series(cl[-60:]); av = float(vol[-63:].mean())
             run5, run10, ext20, rsi = perf(5) or 0, perf(10) or 0, sma(20) or 0, float(rs[-1])
+            # failed gap: gapped up ≥ gap_min% within the last 6 sessions and now trades below that day's close
+            op = h["Open"].to_numpy(); gapfail = None
+            for i in range(max(1, len(cl) - 6), len(cl)):
+                if op[i] >= cl[i - 1] * (1 + c["gap_min"] / 100) and p < cl[i]:
+                    gapfail = round((op[i] / cl[i - 1] - 1) * 100, 1)
             # "ran too far, too fast" — any trigger
-            if not (run5 >= c["run5_min"] or run10 >= c["run10_min"] or ext20 >= c["ext20_min"] or rsi >= c["rsi_hot"]): continue
+            if not (run5 >= c["run5_min"] or run10 >= c["run10_min"] or ext20 >= c["ext20_min"] or gapfail): continue
             rows.append(dict(t=t, co=x.get("longName") or x.get("shortName") or t, mc=x.get("marketCap"), sf=0.0, sr=0.0,
                              pw=perf(5), p10=run10, pm=perf(21), pq=perf(63), s20=sma(20), s50=sma(50), s200=sma(200),
                              hi=round((p / float(cl[-252:].max()) - 1) * 100, 2), lo=round((p / float(cl[-252:].min()) - 1) * 100, 2),
                              rsi=round(rsi, 2), av=av, rv=round(float(vol[-1]) / (av or 1), 2), p=round(p, 2), earn="-",
-                             runway=None, dil=None, ipo_days=None))
+                             runway=None, dil=None, ipo_days=None, gapfail=gapfail))
         except Exception as e: log.warning("puts stage1 %s: %s", t, e)
     log.info("puts: %d names passed the run filter", len(rows))
     for r in rows:
@@ -209,6 +214,7 @@ def stage1_puts():
         elif x["rsi"] >= 60: s += 5
         if x["hi"] is not None and x["hi"] >= -5: s += 4                                          # at/near 52-wk high
         if x["rv"] >= 1.5: s += 4
+        if x.get("gapfail"): s += 8
         x["s1"] = round(s, 1)
     keep.sort(key=lambda x: -x["s1"])
     top = []
@@ -301,12 +307,14 @@ def deep(x, side):
             if o["nohigh3"]: top_ += 5
             if o["volFade"]: top_ += 4
             if o["high20"] <= -5: top_ += 3                                                   # already rolling over
+            if x.get("gapfail"): top_ += 6                                                     # gap up that failed = trapped buyers
             top_ = min(top_, 35)
             s = press + top_ + opt - (5 if o["up3d"] > 10 else 0)                                # still ripping = don't step in front
             if o["up3d"] > 10: flags.append(f"still ripping (+{o['up3d']}% / 3d)")
             if o["rsiDown"]: flags.append("RSI rolling over")
             if o["reversal"]: flags.append("reversal day")
             if o["volFade"]: flags.append("volume fading")
+            if x.get("gapfail"): flags.append(f"failed gap (+{x['gapfail']}%)")
             if x.get("dil"): flags.append("dilution: " + ", ".join(f"{f} {d}" for f, d in x["dil"][:2]))
             if x.get("runway") is not None and x["runway"] < 1: flags.append(f"cash runway {x['runway']}y")
             if x.get("ipo_days") is not None and 150 <= x["ipo_days"] <= 200: flags.append("lockup window")
@@ -338,7 +346,7 @@ def _clean(v):
 
 def assemble(side, mode, universe, pass1, top_in, deep_out, full_asof):
     keys = ("t","co","px","sf","sr","rsi","rsi3","lo","hi","low20","high20","up3d","vr","pq","pm","pw","p10","s20","av","mc","earn",
-            "runway","dil","ipo_days","fuel","bot","opt","score","flags","play","alts","closes","err")
+            "runway","dil","ipo_days","gapfail","fuel","bot","opt","score","flags","play","alts","closes","err")
     top = [{k: o.get(k) for k in keys} for o in deep_out[:16]]
     for o in top: o["lo52"] = o.pop("lo"); o["hi52"] = o.pop("hi")
     rest = [[o["t"], o.get("px"), o.get("sf"), o.get("rsi"), o.get("score"), 1 if o.get("play") else 0] for o in deep_out[16:]]
