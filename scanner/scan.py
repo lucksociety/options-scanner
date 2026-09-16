@@ -43,7 +43,7 @@ CFG = {
                   min_dte=14, max_dte=45, max_ask=0.25, min_oi=25, max_be=60.0),
     # same universe as calls (heavily shorted and cheap) but timed off momentum instead of a bottom
     "breakout": dict(price_min=1.0, price_max=10.0, si_min=15.0, avgvol_min=300_000, deep_n=40,
-                     min_dte=14, max_dte=45, max_ask=0.25, min_oi=25, max_be=50.0),
+                     min_dte=14, max_dte=45, max_ask=0.35, min_oi=25, max_be=60.0),
     "puts":  dict(price_min=3.0, price_max=50.0, si_max=15.0, avgvol_min=500_000, deep_n=40,
                   run5_min=15.0, run10_min=25.0, ext20_min=20.0, gap_min=12.0,       # "ran too far" triggers (any one) — RSI alone is NOT a ticket in
                   min_dte=21, max_dte=45, max_ask=0.35, min_oi=25, max_be=35.0),
@@ -195,6 +195,42 @@ def hv_percentile(cl, n=20):
     if len(hv) < 30: return None
     return int(round((hv < hv[-1]).mean() * 100)), round(float(hv[-1]), 1)
 
+def _ts(v):
+    try: return datetime.fromtimestamp(v, timezone.utc).strftime("%Y-%m-%d") if v else None
+    except Exception: return None
+
+def key_stats(info, r):
+    """Float, ownership and — the part that matters most — the two most recent EXCHANGE short-interest
+    reports, so we can show the reported trend and the date it was measured instead of implying it is live."""
+    r["flt"] = info.get("floatShares"); r["shout"] = info.get("sharesOutstanding")
+    r["ins"] = round(float(info.get("heldPercentInsiders") or 0) * 100, 1)
+    r["inst"] = round(float(info.get("heldPercentInstitutions") or 0) * 100, 1)
+    r["si_date"] = _ts(info.get("dateShortInterest"))
+    ss, ssp = info.get("sharesShort"), info.get("sharesShortPriorMonth")
+    r["ss"], r["ssp"] = ss, ssp
+    r["ssp_date"] = _ts(info.get("sharesShortPreviousMonthDate"))
+    r["si_rep"] = round((ss / ssp - 1) * 100, 1) if (ss and ssp) else None   # change between the two reports
+
+_regsho = None
+def regsho():
+    """Reg SHO threshold list (persistent failures to deliver). Nasdaq publishes it daily; SEC's own copy
+    blocks our runner. Missing list = unknown, never scored as clean."""
+    global _regsho
+    if _regsho is not None: return _regsho
+    _regsho = set()
+    for back in (0, 1, 2, 3):
+        d = (datetime.now(ET) - timedelta(days=back)).strftime("%Y%m%d")
+        try:
+            r = requests.get(f"https://www.nasdaqtrader.com/dynamic/symdir/regsho/nasdaqth{d}.txt",
+                             headers={"User-Agent": BROWSER_UA}, timeout=15)
+            if r.status_code == 200 and "|" in r.text:
+                _regsho = {ln.split("|")[0].strip().upper() for ln in r.text.splitlines()[1:] if "|" in ln}
+                log.info("reg sho: %d threshold securities (%s)", len(_regsho), d); return _regsho
+        except Exception as e:
+            log.debug("regsho %s: %s", d, e)
+    log.warning("reg sho: threshold list unavailable — FTD pressure will read as unknown")
+    return _regsho
+
 def log_metric(kind, t, value, days=30):
     """Append today's value to data/<kind>/<T>.json and report the change vs the oldest sample in the window.
     The LEVEL says how crowded a short is; the TREND says whether shorts are actually being forced."""
@@ -289,9 +325,15 @@ def stage1_calls(kind="calls"):
             perf = lambda n: round((p / float(cl[-1 - n]) - 1) * 100, 2) if len(cl) > n else None
             sma = lambda n: round((p / float(cl[-n:].mean()) - 1) * 100, 2) if len(cl) >= n else None
             rs = rsi_series(cl[-60:]); av = float(vol[-63:].mean()); hvp = hv_percentile(cl)
+            av10 = float(vol[-10:].mean()); hi_ = h["High"].to_numpy(); lo_ = h["Low"].to_numpy()
+            tr = np.maximum(hi_[-15:] - lo_[-15:], np.maximum(abs(hi_[-15:] - cl[-16:-1]), abs(lo_[-15:] - cl[-16:-1])))
             rows.append(dict(t=t, co=x.get("longName") or x.get("shortName") or t, mc=x.get("marketCap"), sf=0.0, sr=0.0,
                              pw=perf(5), pm=perf(21), pq=perf(63), s20=sma(20), s50=sma(50), s200=sma(200),
                              hi=round((p / float(cl[-252:].max()) - 1) * 100, 2), lo=round((p / float(cl[-252:].min()) - 1) * 100, 2),
+                             h20=round((p / float(hi_[-20:].max()) - 1) * 100, 2), h50=round((p / float(hi_[-50:].max()) - 1) * 100, 2),
+                             atr=round(float(tr.mean()) / p * 100, 2),                       # ATR(14) as % of price: how big a normal day is
+                             dv=round(av * p / 1e6, 2),                                       # average daily dollar volume, $M
+                             rv10=round(float(vol[-1]) / (av10 or 1), 2),
                              rsi=round(float(rs[-1]), 2), av=av, rv=round(float(vol[-1]) / (av or 1), 2), p=round(p, 2), earn="-",
                              hvp=hvp[0] if hvp else None, hv=hvp[1] if hvp else None, earn_ts=None))
         except Exception as e: log.warning("%s stage1 %s: %s", kind, t, e)
@@ -300,10 +342,7 @@ def stage1_calls(kind="calls"):
             info = yf.Ticker(r["t"]).info
             r["sf"] = round(float(info.get("shortPercentOfFloat") or 0) * 100, 2); r["sr"] = round(float(info.get("shortRatio") or 0), 2)
             r["earn"] = earn_label(info); r["earn_ts"] = info.get("earningsTimestampStart") or info.get("earningsTimestamp")
-            r["flt"] = info.get("floatShares"); r["shout"] = info.get("sharesOutstanding")
-            r["ins"] = round(float(info.get("heldPercentInsiders") or 0) * 100, 1)
-            sid = info.get("dateShortInterest")
-            r["si_date"] = datetime.fromtimestamp(sid, timezone.utc).strftime("%Y-%m-%d") if sid else None
+            key_stats(info, r)
         except Exception as e: log.warning("info %s: %s", r["t"], e)
         time.sleep(0.15)
     keep = [x for x in rows if x["av"] >= c["avgvol_min"] and x["sf"] >= c["si_min"]]
@@ -337,10 +376,12 @@ def stage1_calls(kind="calls"):
         if len(top) >= c["deep_n"]: break
         if has_options(x["t"]): top.append(x)
         time.sleep(0.1)
+    th = regsho()
     for x in top:
         x["borrow"] = borrow_info(x["t"]); time.sleep(0.2)
         x["dil"], x["k8"] = edgar_recent(x["t"])
         x["shrg"] = share_growth(x["t"])
+        x["ftd"] = (x["t"].upper() in th) if th else None      # None = list unavailable, not "clean"
     log.info("%s stage1: universe=%d pass=%d deep=%d · borrow %d/%d, filings %d/%d", kind, len(rows), len(keep), len(top),
              sum(1 for x in top if x.get("borrow")), len(top), sum(1 for x in top if x.get("dil") is not None), len(top))
     return len(rows), len(keep), top
@@ -386,10 +427,7 @@ def stage1_puts():
             info = yf.Ticker(r["t"]).info
             r["sf"] = round(float(info.get("shortPercentOfFloat") or 0) * 100, 2); r["sr"] = round(float(info.get("shortRatio") or 0), 2)
             r["earn"] = earn_label(info); r["earn_ts"] = info.get("earningsTimestampStart") or info.get("earningsTimestamp")
-            r["flt"] = info.get("floatShares"); r["shout"] = info.get("sharesOutstanding")
-            r["ins"] = round(float(info.get("heldPercentInsiders") or 0) * 100, 1)
-            sid = info.get("dateShortInterest")
-            r["si_date"] = datetime.fromtimestamp(sid, timezone.utc).strftime("%Y-%m-%d") if sid else None
+            key_stats(info, r)
             cash = info.get("totalCash"); fcf = info.get("freeCashflow")
             if cash and fcf is not None and fcf < 0: r["runway"] = round(cash / (-fcf), 1)      # years of cash at current burn
             ft = info.get("firstTradeDateEpochUtc") or info.get("firstTradeDateMilliseconds")
@@ -515,6 +553,9 @@ def deep(x, side):
             o["fee_chg"] = log_metric("fee", x["t"], b.get("fee"))
             if (o["si_chg"] or 0) >= 2: fuel += 2
             if (o["fee_chg"] or 0) >= 5: fuel += 2
+            sir = x.get("si_rep")                              # exchange-reported change between the last two settlement dates
+            if sir is not None: fuel += 3 if sir >= 25 else (2 if sir >= 10 else 0)
+            if x.get("ftd"): fuel += 2                         # Reg SHO threshold list = persistent failures to deliver
             fuel = min(fuel, 35)
             gpts, gflags = gamma_pts(o.get("gam")); flags += gflags
             if side == "calls":
@@ -568,6 +609,8 @@ def deep(x, side):
             if o.get("fltm") is not None and o["fltm"] < 25: flags.append(f"{o['fltm']}M float")
             if (o.get("si_chg") or 0) >= 2: flags.append(f"short interest +{o['si_chg']}pp")
             if (o.get("fee_chg") or 0) >= 5: flags.append(f"borrow fee +{o['fee_chg']}pp")
+            if (x.get("si_rep") or 0) >= 10: flags.append(f"shorts added {x['si_rep']}% since {x.get('ssp_date') or 'last report'}")
+            if x.get("ftd"): flags.append("Reg SHO threshold list")
             if (x.get("shrg") or 0) >= 15: setup -= 3; flags.append(f"shares +{x['shrg']}% in 6mo")   # they keep printing stock
             o.update(fuel=round(fuel, 1), bot=bot)
         else:
@@ -621,9 +664,10 @@ def deep(x, side):
         if ivr is not None and ivr >= 60: flags.append(f"IV rank {ivr} (rich)")
         if not o["play"]:
             d0 = o.get("dud")
-            flags.insert(0, (f"only a junk {'call' if side == 'calls' else 'put'} (bid {d0['bid']:.2f}, "
+            kind_ = "put" if side == "puts" else "call"
+            flags.insert(0, (f"only a junk {kind_} (bid {d0['bid']:.2f}, "
                              f"{d0['spread']}% spread, needs {round(d0['be'])}%)") if d0
-                            else f"no tradeable {'call' if side == 'calls' else 'put'} ≤ ${c['max_ask']:.2f}")
+                            else f"no tradeable {kind_} ≤ ${c['max_ask']:.2f}")
         # Ranking = the stock setup only (fuel/pressure + bottoming/topping), rescaled 0-70 -> 0-100.
         # Contract quality does NOT lift the score: it gates (no tradeable contract caps at 40 and sorts last)
         # and breaks ties between equal setups. A great option can no longer carry a weak setup.
@@ -653,7 +697,7 @@ def _clean(v):
 
 def assemble(side, mode, universe, pass1, top_in, deep_out, full_asof):
     keys = ("t","co","px","sf","sr","rsi","rsi3","lo","hi","low20","high20","up3d","vr","pq","pm","pw","p10","s20","av","mc","earn",
-            "runway","dil","ipo_days","gapfail","borrow","k8","shrg","flt","fltm","ins","si_date","si_chg","fee_chg","gam","hh","stack","coil","recl50","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
+            "runway","dil","ipo_days","gapfail","borrow","k8","shrg","flt","fltm","ins","si_date","si_chg","fee_chg","gam","inst","ss","ssp","ssp_date","si_rep","ftd","atr","dv","rv10","h20","h50","hh","stack","coil","recl50","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
             "fuel","bot","opt","setup","score","flags","play","dud","alts","closes","err")
     top = [{k: o.get(k) for k in keys} for o in deep_out[:16]]
     for o in top: o["lo52"] = o.pop("lo"); o["hi52"] = o.pop("hi")
