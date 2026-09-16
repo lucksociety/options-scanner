@@ -31,6 +31,10 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Run scanner
         run: python scanner/scan.py "${{ inputs.mode || 'auto' }}" both
+      - name: Discord alerts
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: python scanner/alerts.py
       - name: Publish results
         run: |
           if [ -n "$(git status --porcelain data)" ]; then
