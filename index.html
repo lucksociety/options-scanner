@@ -103,6 +103,14 @@ dialog .row{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
 .took{margin-top:6px;font-size:11px;padding:3px 9px;border-color:var(--gold-deep);color:var(--gold)} .took.on{background:var(--gold);color:#1B1405}
 select{font:500 13px "IBM Plex Sans",sans-serif;color:var(--ink);background:var(--bg2);border:1px solid var(--line);border-radius:5px;padding:5px 8px}
 .hist{color:var(--gold);font-weight:600}
+.rg{display:grid;grid-template-columns:minmax(120px,max-content) 1fr;gap:14px;align-items:center;background:var(--bg2);border:1px solid var(--line);border-left-width:4px;border-radius:6px;padding:12px 14px;margin-bottom:10px}
+.rg .big{font-size:30px;font-weight:600;line-height:1;font-family:"IBM Plex Mono",ui-monospace,monospace;font-variant-numeric:tabular-nums}
+.rg .lab{font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink3);margin-bottom:3px}
+.rg p{margin:0 0 4px;font-size:13.5px} .rg .bits{font-size:11.5px;color:var(--ink3);font-family:"IBM Plex Mono",ui-monospace,monospace}
+.rg.green{border-left-color:var(--good)} .rg.green .big{color:var(--good)}
+.rg.amber{border-left-color:#d8a23a} .rg.amber .big{color:#d8a23a}
+.rg.red{border-left-color:var(--bad)} .rg.red .big{color:var(--bad)}
+@media(max-width:620px){.rg{grid-template-columns:1fr}}
 .track{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:6px}
 .track div{background:var(--bg2);border:1px solid var(--line);border-radius:6px;padding:10px 12px}
 .track .k{font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink3)} .track b{display:block;font-size:22px;font-weight:600;line-height:1.1;margin-top:2px}
@@ -242,6 +250,7 @@ function render(d){
   const S=SIDES[side]; $('#eyebrow').textContent=S.eyebrow; document.title='Luck Society Option Scanner · '+({calls:'Calls',puts:'Puts',breakout:'Breakout'}[side]);
   $('#funnel').innerHTML=`<div><b>${d.universe}</b><span>${S.f1}</span></div><div><b>${d.pass1}</b><span>${S.f2}</span></div><div><b>${d.deep}</b><span>${S.f3}</span></div><div><b>${tradeable}</b><span>${S.f4}</span></div>`;
   $('#main').innerHTML=`
+  ${regimePanel(d.market)}
   ${trackPanel()}
   <div class="rule"><h2>Ranked ${side==='puts'?'put':(side==='breakout'?'breakout call':'call')} plays${histDate?` <span class="hist">· ${histDate}</span>`:''}</h2><p>${S.rule}</p></div>
   ${d.top.map((o,i)=>row(i+1,o)).join('')}
@@ -254,6 +263,7 @@ function render(d){
     <div><h3>${S.m1[0]}</h3><p>${S.m1[1]}</p></div>
     <div><h3>${S.m2[0]}</h3><p>${S.m2[1]}</p></div>
     <div><h3>${S.m3[0]}</h3><p>${S.m3[1]}</p></div>
+    <div><h3>Market regime</h3><p>Scored 0–100 each run from free index data: index trend (20), small-cap leadership — IWM against SPY (20), VIX level and direction, elevated but falling being the sweet spot (15), speculative appetite — ARKK, XBI, high-beta and bitcoin against SPY (15), rebound after a pullback (10), breadth — equal-weight against cap-weight (10), and 10-year yields (10). Components we cannot measure are dropped and the rest rescaled, so missing data never pays points. The regime is 15% of every board score: the same setup is worth less when shorts are being rewarded.</p></div>
     <div><h3>Track record</h3><p>Every evening the tracker re-checks past picks: a <b>hit</b> means the contract is (or expired) worth 2× the entry ask, or the stock reached its breakeven within 20 sessions; a <b>bust</b> means it expired worthless or is down 70%+ with under 5 days left. Hit-rate is hits ÷ (hits + busts); open picks are not counted yet. Treat anything under ~30 decided picks as noise.</p></div>
     <div><h3>Extras on each card</h3><p>Click a card to expand it: borrow fee and shares available (Interactive Brokers via iBorrowDesk), IV rank (our own daily IV log once it has 20 days, realized-vol percentile until then — rank ≥ 60 costs the contract 2 pts, ≥ 80 costs 4), pre-market quote when the scan runs before the open, earnings inside the contract window (−8 pts, flagged red), and realized dilution (share count over 6 months). "Took it" logs a paper trade in this browser and the tracker fills in what happened.</p></div>
   </section>
@@ -261,6 +271,13 @@ function render(d){
 }
 // ---- track record / history / paper trades
 let track=null, trackDay=null, histDate='', research=null;
+function regimePanel(m){
+  if(!m||m.score==null)return '';
+  const P=m.parts||{},W=m.weights||{};
+  const bits=Object.keys(W).map(k=>P[k]==null?`<span class="dim">${k} n/a</span>`:`${k} ${Math.round(P[k])}/${W[k]}`).join(' · ');
+  return `<div class="rg ${esc(m.band)}"><div><div class="lab">Market regime</div><div class="big">${Math.round(m.score)}</div></div>
+  <div><p>${esc(m.verdict)}</p><div class="bits">${bits}</div><div class="bits">${(m.notes||[]).map(esc).join(' · ')}</div></div></div>`;
+}
 function trackPanel(){
   const s=track&&track.sides&&track.sides[side]; if(!s)return '';
   const B=s.buckets, order=['70+','60-69','50-59','<50'];
