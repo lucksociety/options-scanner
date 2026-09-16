@@ -152,7 +152,7 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const money=x=>x==null?'–':'$'+Number(x).toFixed(2);
 const fmtInt=x=>Number(x||0).toLocaleString('en-US');
 const SIDES={calls:{path:'data/latest.json',letter:'C',eyebrow:'Pre-market · heavily shorted · under $10',f1:'Optionable, <$10, SI ≥ 15%',f2:'Passed screen',f3:'Deep-scanned',f4:'With a call ≤ $0.25',rule:'Ranked by squeeze potential: short float, days to cover, borrow, and how bottomed the chart looks. Contract quality is a gate, not a boost \u2014 a name with no liquid call is capped and sorted last, but a great option never lifts a weak setup. Top 3 in gold.',none:'No liquid call ≤ $0.25 in the 2–6 wk window',legend:['fuel','bottom','contract'],watch:'Passed the short-interest and bottoming screens but no liquid call at or under $0.25 expiring in 2–6 weeks, or scored below the cut.',m1:['Squeeze fuel (0–35)','The score is the setup alone (fuel + bottoming, 0–70) rescaled to 0–100. Short float up to 60% earns up to 20 pts; days to cover up to 10 earns up to 7. Borrow fee (Interactive Brokers, near-real-time) adds 1/3/5 at 5%/20%/50%, and fewer than 500K/100K shares available to borrow adds 1/3 — when the borrow feed is unavailable those 8 points are redistributed rather than left unreachable. Short float itself is FINRA settlement data, published twice a month.'],m2:['Bottoming (0–35)','RSI-14 between 25 and 45 (+10), RSI higher than 3 sessions ago (+10), touched oversold in the last 10 sessions (+5), within 8% of the 20-day low or 15% of the 52-week low (+5), 3-day volume ≥ 1.3× the 20-day average (+5), gapping up 2–15% pre-market (+3). A drop of more than 10% over 3 days costs 5.'],m3:['Contract (0–30)','Best out-of-the-money call with ask ≤ $0.25, expiring 14–45 days out, open interest ≥ 25 and a workable spread; anything needing more than +60% to break even is excluded. Scored 0–30 for open interest, spread and breakeven — but that score no longer feeds the ranking. It gates (no tradeable call = capped at 40 and sorted last) and breaks ties between equal setups.']},
- breakout:{path:'data/breakout/latest.json',letter:'C',eyebrow:'Already turning · heavily shorted · under $10',f1:'Optionable, <$10, SI ≥ 15%',f2:'Passed screen',f3:'Deep-scanned',f4:'With a call ≤ $0.25',rule:'Same shorted universe as the Calls board, timed off momentum instead of a bottom: names already trending — higher highs and lows, above the 20 and 50-day, coiling or pressing the 20-day high on rising volume. Contract quality is a gate, not a boost. Top 3 in gold.',none:'No liquid call ≤ $0.25 in the 2–6 wk window',legend:['fuel','breakout','contract'],watch:'Shorted and trending, but no liquid call at or under $0.25 expiring in 2–6 weeks, or scored below the cut.',m1:['Squeeze fuel (0–35)','Short float (up to 15), float size (up to 8 — under 10M shares is worth the most), days to cover (up to 6), borrow fee and shares available (up to 6), plus 2 each when short interest is rising 2pp or the borrow fee is up 5pp over the last month. Same fuel as the Calls board: what happens if it runs.'],m2:['Breakout (0–35)','Higher highs and higher lows over the last 10 sessions vs the 10 before (+6), price above the 20-day with the 20 above the 50 (+6, or +3 just above the 20-day), within 3% of the 20-day high (+8) or 8% (+4), the 10-day range compressed under 60% of the prior 20-day range (+5), a 50-day reclaim in the last week (+4), volume 2× the 20-day (+8) or 1.3× (+5), RSI 50–72 (+4) while RSI over 78 costs 3, a 1–12% pre-market bid (+3), plus call positioning (up to 8). Already up more than 25% in 3 days costs 6 — that is chasing.'],m3:['Contract (0–30)','Best out-of-the-money call with ask ≤ $0.25, expiring 14–45 days out, open interest ≥ 25 and a workable spread; anything needing more than a 50% move is excluded. Scored 0–30 — a gate and a tiebreak, not part of the ranking.']},
+ breakout:{path:'data/breakout/latest.json',letter:'C',eyebrow:'Already turning · heavily shorted · under $10',f1:'Optionable, <$10, SI ≥ 15%',f2:'Passed screen',f3:'Deep-scanned',f4:'With a call ≤ $0.35',rule:'Same shorted universe as the Calls board, timed off momentum instead of a bottom: names already trending — higher highs and lows, above the 20 and 50-day, coiling or pressing the 20-day high on rising volume. Contract quality is a gate, not a boost. Top 3 in gold.',none:'No liquid call ≤ $0.35 in the 2–6 wk window',legend:['fuel','breakout','contract'],watch:'Shorted and trending, but no liquid call at or under $0.35 expiring in 2–6 weeks, or scored below the cut.',m1:['Squeeze fuel (0–35)','Short float (up to 15), float size (up to 8 — under 10M shares is worth the most), days to cover (up to 6), borrow fee and shares available (up to 6), plus 2 each when short interest is rising 2pp or the borrow fee is up 5pp over the last month. Same fuel as the Calls board: what happens if it runs.'],m2:['Breakout (0–35)','Higher highs and higher lows over the last 10 sessions vs the 10 before (+6), price above the 20-day with the 20 above the 50 (+6, or +3 just above the 20-day), within 3% of the 20-day high (+8) or 8% (+4), the 10-day range compressed under 60% of the prior 20-day range (+5), a 50-day reclaim in the last week (+4), volume 2× the 20-day (+8) or 1.3× (+5), RSI 50–72 (+4) while RSI over 78 costs 3, a 1–12% pre-market bid (+3), plus call positioning (up to 8). Already up more than 25% in 3 days costs 6 — that is chasing.'],m3:['Contract (0–30)','Best out-of-the-money call with ask ≤ $0.35 — higher than the Calls board, because names already pressing highs price their cheap calls much further out — expiring 14–45 days out, open interest ≥ 25 and a workable spread; anything needing more than a 60% move is excluded. Scored 0–30 — a gate and a tiebreak, not part of the ranking.']},
  puts:{path:'data/puts/latest.json',letter:'P',eyebrow:'Overextended · forced sellers · $3–$50',f1:'$3–50, vol ≥ 500K, SI < 15%',f2:'Ran too far, too fast',f3:'Deep-scanned',f4:'With a put ≤ $0.35',rule:'Ranked by downside setup: how far it ran, extension, cash burn, dilution, and topping signals. Contract quality is a gate, not a boost \u2014 no liquid put means capped and sorted last, but a cheap put never lifts a weak setup. Top 3 in gold.',none:'No liquid put ≤ $0.35 in the 3–6 wk window',legend:['pressure','topping','contract'],watch:'Ran hard but no liquid put at or under $0.35 expiring in 3–6 weeks, or scored below the cut.',m1:['Downside pressure (0–35)','Size of the 5/10-day run (up to 12), extension above the 20-day average (up to 8), short float under 8% so a squeeze can\'t run you over (+3), cash runway under 1 year (+6) or 2 years (+3), shares outstanding up 10%+ over 6 months (+6) or 5%+ (+3) — real dilution measured from the share count, since sec.gov blocks our servers — IPO lockup expiring (+4).'],m2:['Topping (0–35)','RSI ≥ 70 (+8) or ≥ 60 (+4), RSI lower than 3 sessions ago (+8), closed below the prior day\'s low (+7), a 12%+ gap up in the last week that has since failed (+6), no new high in 3 sessions (+5), volume fading from the peak day (+4), already 5% off the 20-day high (+3), gapping down 2%+ pre-market (+3). Still up more than 10% over 3 days costs 5 — don\'t step in front of it.'],m3:['Contract (0–30)','Best out-of-the-money put with ask ≤ $0.35, expiring 21–45 days out, open interest ≥ 25 and a workable spread; anything needing more than a 35% drop is excluded. Scored 0–30 — a gate and a tiebreak, not part of the ranking.']}};
 let side='calls'; try{side=localStorage.getItem('squeeze.side')||'calls'}catch{}
 const MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -210,8 +210,11 @@ function detail(o){
   const out=[];
   out.push(kv('Avg volume',fmtInt(Math.round(o.av||0))),kv('Market cap',o.mc?'$'+(o.mc/1e6).toFixed(0)+'M':'–'),kv('52-wk range',`${o.lo52!=null?(o.lo52>0?'+':'')+Math.round(o.lo52)+'% off low':'–'} · ${o.hi52!=null?Math.round(o.hi52)+'% off high':'–'}`));
   out.push(kv('Earnings',o.earn&&o.earn!=='-'?o.earn+(o.earn_in?' <b class="warn">inside contract window</b>':''):'none scheduled'));
-  out.push(kv('Float',o.fltm!=null?o.fltm+'M shares'+(o.ins?` · insiders ${o.ins}%`:''):'–'));
-  out.push(kv('Short interest',`${(o.sf??0).toFixed(1)}% of float${o.si_date?` <small>(as of ${o.si_date} — exchanges report twice a month)</small>`:''}${o.si_chg!=null?` · ${o.si_chg>0?'+':''}${o.si_chg}pp vs 30d ago`:''}`));
+  out.push(kv('Float',o.fltm!=null?o.fltm+'M shares'+(o.ins?` · insiders ${o.ins}%`:'')+(o.inst?` · institutions ${o.inst}%`:''):'–'));
+  out.push(kv('Short interest',`${(o.sf??0).toFixed(1)}% of float${o.si_date?` <small>(reported as of ${o.si_date}, not today)</small>`:''}`+(o.si_rep!=null?` · shares short ${o.si_rep>0?'+':''}${o.si_rep}% vs the ${o.ssp_date||'prior'} report`:'')+(o.si_chg!=null?` · ${o.si_chg>0?'+':''}${o.si_chg}pp vs our log 30d ago`:'')));
+  out.push(kv('Threshold list (FTD)',o.ftd==null?'<span class="dim">list unavailable</span>':(o.ftd?'<b class="hot">on the Reg SHO threshold list</b> — persistent failures to deliver':'not listed')));
+  out.push(kv('Liquidity',`${o.dv!=null?'$'+o.dv+'M a day':'–'}${o.atr!=null?` · ATR ${o.atr}% of price`:''}${o.rv10!=null?` · ${o.rv10}× the 10-day volume`:''}`));
+  out.push(kv('Distance to highs',`${o.h20!=null?Math.round(o.h20)+'% from the 20-day high':'–'}${o.h50!=null?` · ${Math.round(o.h50)}% from the 50-day`:''}${o.hi52!=null?` · ${Math.round(o.hi52)}% from the 52-week`:''}`));
   if(o.gam)out.push(kv('Options positioning',`call OI ${fmtInt(o.gam.coi)} vs put ${fmtInt(o.gam.poi)}${o.gam.cp!=null?` (${o.gam.cp}×)`:''}${o.gam.ramp_adv!=null?` · calls 0–20% above spot cover ${o.gam.ramp_adv}× a day's volume`:''}`));
   out.push(kv('Borrow (IBKR)',o.borrow?`${o.borrow.fee}% fee${o.fee_chg!=null?` (${o.fee_chg>0?'+':''}${o.fee_chg}pp vs 30d)`:''} · ${fmtInt(o.borrow.avail)} shares available`:'no data'));
   out.push(kv('IV rank',o.iv_rank!=null?`${o.iv_rank} <small>(${o.ivr_src==='iv'?'own IV log':'realized-vol proxy'})</small>${o.atm_iv?' · ATM IV '+o.atm_iv+'%':''}`:'–'));
@@ -219,6 +222,17 @@ function detail(o){
   out.push(kv('SEC filings',(o.dil&&o.dil.length?o.dil.map(d=>d[0]+' '+d[1]).join(', '):'none in 120d (SEC blocks our host)')+(o.k8?' · 8-K '+o.k8:'')));
   if(side==='puts'){out.push(kv('Cash runway',o.runway!=null?o.runway+' yrs at current burn':'–'),kv('Days since IPO',o.ipo_days??'–'));}
   if(o.alts&&o.alts.length)out.push(kv('Other contracts',o.alts.map(a=>`${esc(code(o.t,a))} ${a.bid.toFixed(2)}×${a.ask.toFixed(2)} OI ${fmtInt(a.oi)} · needs ${Math.round(a.be)}%`).join('<br>')));
+  const rn=research&&research.notes&&research.notes[o.t];
+  if(rn){
+    const src=(rn.sources||[]).map(x=>`<a href="${esc(x.u)}" target="_blank" rel="noopener">${esc(x.t)}</a>${x.d?` <span class="dim">${esc(x.d)}</span>`:''}`).join(' · ');
+    out.push(kv('Squeeze thesis',esc(rn.thesis||'–')));
+    if(rn.catalyst)out.push(kv('Catalyst',esc(rn.catalyst)));
+    if(rn.trigger)out.push(kv('Trigger',esc(rn.trigger)));
+    if(rn.invalid)out.push(kv('Invalidation',esc(rn.invalid)));
+    if(rn.dilution)out.push(kv('Dilution risk',esc(rn.dilution)));
+    if(rn.bear)out.push(kv('Bear case',esc(rn.bear)));
+    if(src)out.push(kv('Sources',src+(research.date?` <span class="dim">· researched ${esc(research.date)}</span>`:'')));
+  }
   const tr=trackFor(o); if(tr)out.push(kv('What happened next',`stock +5d ${fmt(tr.r5)} · +10d ${fmt(tr.r10)} · +20d ${fmt(tr.r20)} · best ${fmt(tr.best)} · option ${tr.mark!=null?'$'+tr.mark.toFixed(2)+' ('+(tr.opt_ret>0?'+':'')+tr.opt_ret+'%)':'–'} · <b>${tr.status}</b>`));
   return out.join('');
 }
@@ -233,7 +247,7 @@ function render(d){
   ${d.top.map((o,i)=>row(i+1,o)).join('')}
   ${tradesPanel()}
   <div class="rule"><h2>Watchlist</h2><p>${S.watch}</p></div>
-  <div class="twrap"><table><thead><tr><th>Ticker</th><th>Price</th><th>Short float</th><th>RSI</th><th>Score</th><th>${side==='puts'?'Put ≤ $0.35':'Call ≤ $0.25'}</th></tr></thead><tbody>
+  <div class="twrap"><table><thead><tr><th>Ticker</th><th>Price</th><th>Short float</th><th>RSI</th><th>Score</th><th>${side==='puts'?'Put ≤ $0.35':(side==='breakout'?'Call ≤ $0.35':'Call ≤ $0.25')}</th></tr></thead><tbody>
   ${d.rest.map(r=>`<tr><td class="t"><a href="https://finviz.com/quote.ashx?t=${esc(r[0])}" target="_blank" rel="noopener">${esc(r[0])}</a></td><td>${money(r[1])}</td><td class="hot">${(r[2]??0).toFixed(1)}%</td><td>${Math.round(r[3]??0)}</td><td>${Math.round(r[4]??0)}</td><td>${r[5]?'yes':'<span class="dim">none</span>'}</td></tr>`).join('')}
   </tbody></table></div>
   <section class="method">
@@ -246,7 +260,7 @@ function render(d){
   <p class="caveat">Quotes from Yahoo Finance at scan time; outside market hours bids often show 0.00 and the last trade is the better guide. All three boards run a full screen each morning; quotes and scores refresh every 5 minutes through the close, and this page checks for new data every 60 seconds. Screening tool, not a recommendation — check the chain, news and pending earnings before entering.</p>`;
 }
 // ---- track record / history / paper trades
-let track=null, trackDay=null, histDate='';
+let track=null, trackDay=null, histDate='', research=null;
 function trackPanel(){
   const s=track&&track.sides&&track.sides[side]; if(!s)return '';
   const B=s.buckets, order=['70+','60-69','50-59','<50'];
@@ -256,6 +270,10 @@ function trackPanel(){
 function trackFor(o){
   if(!trackDay)return null; const p=o.play; if(!p)return null;
   return trackDay.find(r=>r.t===o.t&&r.exp===p.exp&&Math.abs(r.strike-p.strike)<1e-6)||null;
+}
+async function loadResearch(){
+  // written by the daily research pass (a Claude session, not the cron scanner) — absent is normal
+  try{const r=await fetch('data/research/latest.json?t='+Date.now(),{cache:'no-store'});research=r.ok?await r.json():null;}catch{research=null}
 }
 async function loadTrack(){
   try{const r=await fetch('data/track/summary.json?t='+Date.now(),{cache:'no-store'});track=r.ok?await r.json():null;}catch{track=null}
@@ -317,7 +335,7 @@ function paintAge(){
 async function load(manual){
   if(histDate&&!manual)return;
   try{
-    if(!track)await loadTrack(); if(!openAll)await loadOpen();
+    if(!track)await loadTrack(); if(!openAll)await loadOpen(); if(!research)await loadResearch();
     let r=null;
     for(const p of [SIDES[side].path]){
       try{ r=await fetch(p+'?t='+Date.now(),{cache:'no-store'}); if(r.ok)break; }catch(e){ r=null; }
