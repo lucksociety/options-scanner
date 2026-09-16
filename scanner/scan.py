@@ -163,7 +163,14 @@ def share_growth(t):
     Measures dilution that actually happened rather than dilution a company is merely allowed to do."""
     try:
         end = datetime.now(timezone.utc); start = end - timedelta(days=200)
-        ser = yf.Ticker(t).get_shares_full(start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"))
+        tk = yf.Ticker(t)
+        sp = tk.splits                                   # a split rewrites the share count: the signal would be nonsense
+        if sp is not None and len(sp):
+            idx = sp.index
+            try: idx = idx.tz_localize(None) if getattr(idx, "tz", None) is not None else idx
+            except Exception: pass
+            if (idx >= pd.Timestamp(start.replace(tzinfo=None))).any(): return None
+        ser = tk.get_shares_full(start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"))
         if ser is None or len(ser) < 2: return None
         ser = ser.dropna()
         if len(ser) < 2: return None
@@ -397,8 +404,11 @@ def deep(x, side):
         if ivpen and contracts:
             for z in contracts: z["q"] = round(z["q"] - ivpen, 1)
             contracts.sort(key=lambda z: -z["q"])
-        o["play"] = contracts[0] if contracts else None; o["alts"] = contracts[1:3]
-        opt = max(o["play"]["q"], 0) if o["play"] else 0
+        # A contract only counts as tradeable if its quality is actually positive. A zero bid with a 100%
+        # spread and a breakeven halfway to the moon is not a play, and shouldn't pass the gate.
+        o["play"] = contracts[0] if contracts and contracts[0]["q"] > 0 else None; o["alts"] = contracts[1:3]
+        if o["play"] is None and contracts: o["dud"] = contracts[0]     # keep it visible on the card
+        opt = o["play"]["q"] if o["play"] else 0
         flags = []
         # earnings inside the contract window = binary event, not a squeeze/topping trade
         o["earn_in"] = False
@@ -477,7 +487,11 @@ def deep(x, side):
             if re.match(f"^({mn[m-1]}|{mn[m % 12]})", o["earn"]): flags.append(f"earnings {o['earn']}")
         if x.get("k8"): flags.append(f"8-K filed {x['k8'][5:]}")
         if ivr is not None and ivr >= 60: flags.append(f"IV rank {ivr} (rich)")
-        if not o["play"]: flags.insert(0, f"no tradeable {'call' if side == 'calls' else 'put'} ≤ ${c['max_ask']:.2f}")
+        if not o["play"]:
+            d0 = o.get("dud")
+            flags.insert(0, (f"only a junk {'call' if side == 'calls' else 'put'} (bid {d0['bid']:.2f}, "
+                             f"{d0['spread']}% spread, needs {round(d0['be'])}%)") if d0
+                            else f"no tradeable {'call' if side == 'calls' else 'put'} ≤ ${c['max_ask']:.2f}")
         # Ranking = the stock setup only (fuel/pressure + bottoming/topping), rescaled 0-70 -> 0-100.
         # Contract quality does NOT lift the score: it gates (no tradeable contract caps at 40 and sorts last)
         # and breaks ties between equal setups. A great option can no longer carry a weak setup.
@@ -508,7 +522,7 @@ def _clean(v):
 def assemble(side, mode, universe, pass1, top_in, deep_out, full_asof):
     keys = ("t","co","px","sf","sr","rsi","rsi3","lo","hi","low20","high20","up3d","vr","pq","pm","pw","p10","s20","av","mc","earn",
             "runway","dil","ipo_days","gapfail","borrow","k8","shrg","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
-            "fuel","bot","opt","setup","score","flags","play","alts","closes","err")
+            "fuel","bot","opt","setup","score","flags","play","dud","alts","closes","err")
     top = [{k: o.get(k) for k in keys} for o in deep_out[:16]]
     for o in top: o["lo52"] = o.pop("lo"); o["hi52"] = o.pop("hi")
     rest = [[o["t"], o.get("px"), o.get("sf"), o.get("rsi"), o.get("score"), 1 if o.get("play") else 0] for o in deep_out[16:]]
