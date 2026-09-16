@@ -97,6 +97,17 @@ dialog h3{font-size:18px;margin-bottom:4px} dialog p{font-size:13px;color:var(--
 dialog label{display:block;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink3);margin-top:10px}
 dialog input{width:100%;font:14px "IBM Plex Mono",monospace;padding:7px 9px;border:1px solid var(--line);border-radius:4px;background:var(--bg);color:var(--ink)}
 dialog .row{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+.pick{cursor:pointer} .pick .detail{grid-column:2/-1;display:none;border-top:1px solid var(--line);padding-top:10px;margin-top:2px;font-size:12.5px;color:var(--ink2)}
+.pick.open .detail{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:6px 18px}
+.detail b{color:var(--ink)} .detail .k{font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink3);display:block}
+.took{margin-top:6px;font-size:11px;padding:3px 9px;border-color:var(--gold-deep);color:var(--gold)} .took.on{background:var(--gold);color:#1B1405}
+select{font:500 13px "IBM Plex Sans",sans-serif;color:var(--ink);background:var(--bg2);border:1px solid var(--line);border-radius:5px;padding:5px 8px}
+.hist{color:var(--gold);font-weight:600}
+.track{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:6px}
+.track div{background:var(--bg2);border:1px solid var(--line);border-radius:6px;padding:10px 12px}
+.track .k{font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink3)} .track b{display:block;font-size:22px;font-weight:600;line-height:1.1;margin-top:2px}
+.track small{color:var(--ink3);font-size:11px} .track .hi b{color:var(--good)} .track .lo b{color:var(--bad)}
+.trades td.pl.up{color:var(--good)} .trades td.pl.dn{color:var(--bad)} .trades button{font-size:11px;padding:2px 8px}
 .toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:var(--gold);color:#1B1405;font-weight:600;padding:9px 14px;border-radius:6px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none}
 .toast.show{opacity:1}
 @media (max-width:980px){
@@ -116,6 +127,7 @@ dialog .row{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
       <span class="seg" role="tablist"><button id="sideCalls" class="on" role="tab">Calls</button><button id="sidePuts" role="tab">Puts</button></span>
       <span class="age" id="age"><i></i><span id="ageText">loading…</span></span>
       <span id="modeText" class="dim"></span>
+      <select id="histSel" title="Look back at a previous morning's board"><option value="">Latest</option></select>
       <button id="refreshBtn" title="Re-fetch the latest results now">Refresh</button>
       <button id="scanBtn" class="primary" title="Start a new scan on GitHub Actions">Scan now</button>
       <button id="setupBtn" title="Connect this page to your GitHub repo so Scan now works">⚙</button>
@@ -139,8 +151,8 @@ const $=s=>document.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const money=x=>x==null?'–':'$'+Number(x).toFixed(2);
 const fmtInt=x=>Number(x||0).toLocaleString('en-US');
-const SIDES={calls:{path:'data/latest.json',letter:'C',eyebrow:'Pre-market · heavily shorted · under $10',f1:'Optionable, <$10, SI ≥ 15%',f2:'Passed screen',f3:'Deep-scanned',f4:'With a call ≤ $0.25',rule:'Score = squeeze fuel (short float, days to cover) + bottoming signals (RSI, lows, volume) + contract quality (open interest, spread, breakeven). Top 3 in gold.',none:'No liquid call ≤ $0.25 in the 2–6 wk window',legend:['fuel','bottom','contract'],watch:'Passed the short-interest and bottoming screens but no liquid call at or under $0.25 expiring in 2–6 weeks, or scored below the cut.',m1:['Squeeze fuel (0–35)','Short float up to 50% earns up to 25 pts; days to cover up to 10 earns up to 10. Source: Yahoo (FINRA settlement data, published twice a month).'],m2:['Bottoming (0–35)','RSI-14 between 25 and 45 (+10), RSI higher than 3 sessions ago (+10), touched oversold in the last 10 sessions (+5), within 8% of the 20-day low or 15% of the 52-week low (+5), 3-day volume ≥ 1.3× the 20-day average (+5). A drop of more than 10% over 3 days costs 5.'],m3:['Contract (0–30)','Best out-of-the-money call with ask ≤ $0.25, expiring 14–45 days out, open interest ≥ 25 and a workable spread. Rewards open interest, tight spreads and a breakeven move under ~15%; anything needing more than +60% is excluded.']},
- puts:{path:'data/puts/latest.json',letter:'P',eyebrow:'Overextended · forced sellers · $3–$50',f1:'$3–50, vol ≥ 500K, SI < 15%',f2:'Ran too far, too fast',f3:'Deep-scanned',f4:'With a put ≤ $0.35',rule:'Score = downside pressure (size of the run, extension, cash burn, dilution filings, lockup) + topping signals (RSI rolling over, reversal day, fading volume) + contract quality. Top 3 in gold.',none:'No liquid put ≤ $0.35 in the 3–6 wk window',legend:['pressure','topping','contract'],watch:'Ran hard but no liquid put at or under $0.35 expiring in 3–6 weeks, or scored below the cut.',m1:['Downside pressure (0–35)','Size of the 5/10-day run (up to 12), extension above the 20-day average (up to 8), short float under 8% so a squeeze can\'t run you over (+3), cash runway under 1 year (+6) or 2 years (+3), a shelf or offering filed with the SEC in the last 120 days (+6), IPO lockup expiring (+4).'],m2:['Topping (0–35)','RSI ≥ 70 (+8) or ≥ 60 (+4), RSI lower than 3 sessions ago (+8), closed below the prior day\'s low (+7), a 12%+ gap up in the last week that has since failed (+6), no new high in 3 sessions (+5), volume fading from the peak day (+4), already 5% off the 20-day high (+3). Still up more than 10% over 3 days costs 5 — don\'t step in front of it.'],m3:['Contract (0–30)','Best out-of-the-money put with ask ≤ $0.35, expiring 21–45 days out, open interest ≥ 25 and a workable spread. Rewards open interest, tight spreads and a breakeven drop under ~10%; anything needing more than a 35% drop is excluded.']}};
+const SIDES={calls:{path:'data/latest.json',letter:'C',eyebrow:'Pre-market · heavily shorted · under $10',f1:'Optionable, <$10, SI ≥ 15%',f2:'Passed screen',f3:'Deep-scanned',f4:'With a call ≤ $0.25',rule:'Score = squeeze fuel (short float, days to cover) + bottoming signals (RSI, lows, volume) + contract quality (open interest, spread, breakeven). Top 3 in gold.',none:'No liquid call ≤ $0.25 in the 2–6 wk window',legend:['fuel','bottom','contract'],watch:'Passed the short-interest and bottoming screens but no liquid call at or under $0.25 expiring in 2–6 weeks, or scored below the cut.',m1:['Squeeze fuel (0–35)','Short float up to 50% earns up to 20 pts; days to cover up to 10 earns up to 7. Borrow fee (Interactive Brokers, near-real-time) adds 1/3/5 at 5%/20%/50%, and fewer than 500K/100K shares available to borrow adds 1/3. Short float itself is FINRA settlement data, published twice a month.'],m2:['Bottoming (0–35)','RSI-14 between 25 and 45 (+10), RSI higher than 3 sessions ago (+10), touched oversold in the last 10 sessions (+5), within 8% of the 20-day low or 15% of the 52-week low (+5), 3-day volume ≥ 1.3× the 20-day average (+5), gapping up 2–15% pre-market (+3). A drop of more than 10% over 3 days costs 5.'],m3:['Contract (0–30)','Best out-of-the-money call with ask ≤ $0.25, expiring 14–45 days out, open interest ≥ 25 and a workable spread. Rewards open interest, tight spreads and a breakeven move under ~15%; anything needing more than +60% is excluded.']},
+ puts:{path:'data/puts/latest.json',letter:'P',eyebrow:'Overextended · forced sellers · $3–$50',f1:'$3–50, vol ≥ 500K, SI < 15%',f2:'Ran too far, too fast',f3:'Deep-scanned',f4:'With a put ≤ $0.35',rule:'Score = downside pressure (size of the run, extension, cash burn, dilution filings, lockup) + topping signals (RSI rolling over, reversal day, fading volume) + contract quality. Top 3 in gold.',none:'No liquid put ≤ $0.35 in the 3–6 wk window',legend:['pressure','topping','contract'],watch:'Ran hard but no liquid put at or under $0.35 expiring in 3–6 weeks, or scored below the cut.',m1:['Downside pressure (0–35)','Size of the 5/10-day run (up to 12), extension above the 20-day average (up to 8), short float under 8% so a squeeze can\'t run you over (+3), cash runway under 1 year (+6) or 2 years (+3), a shelf or offering filed with the SEC in the last 120 days (+6), IPO lockup expiring (+4).'],m2:['Topping (0–35)','RSI ≥ 70 (+8) or ≥ 60 (+4), RSI lower than 3 sessions ago (+8), closed below the prior day\'s low (+7), a 12%+ gap up in the last week that has since failed (+6), no new high in 3 sessions (+5), volume fading from the peak day (+4), already 5% off the 20-day high (+3), gapping down 2%+ pre-market (+3). Still up more than 10% over 3 days costs 5 — don\'t step in front of it.'],m3:['Contract (0–30)','Best out-of-the-money put with ask ≤ $0.35, expiring 21–45 days out, open interest ≥ 25 and a workable spread. Rewards open interest, tight spreads and a breakeven drop under ~10%; anything needing more than a 35% drop is excluded.']}};
 let side='calls'; try{side=localStorage.getItem('squeeze.side')||'calls'}catch{}
 const MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 function code(t,c){const d=new Date(c.exp+'T12:00:00Z');return `${t} ${MON[d.getUTCMonth()]} ${d.getUTCDate()} $${Number(c.strike)%1?c.strike:Number(c.strike).toFixed(0)} ${SIDES[side].letter}`;}
@@ -154,22 +166,23 @@ function spark(closes,w=120,h=32){
 }
 function row(i,o){
   const p=o.play,up=o.rsi>o.rsi3;
-  const flags=(o.flags||[]).map(f=>`<span class="flag ${/falling|ripping|no tradeable/.test(f)?'bad':(/RSI|volume|reversal|dilution|runway|failed gap/.test(f)?'good':'note')}">${esc(f)}</span>`).join('');
+  const flags=(o.flags||[]).map(f=>`<span class="flag ${/falling|ripping|no tradeable|inside window|rich/.test(f)?'bad':(/RSI|volume|reversal|dilution|runway|failed gap/.test(f)?'good':'note')}">${esc(f)}</span>`).join('');
   let play,alts='';
   if(p){
-    play=`<div class="play"><div class="code">${esc(code(o.t,p))}</div><div class="quote"><b>${p.bid.toFixed(2)}</b> × <b>${p.ask.toFixed(2)}</b><span class="dim"> last ${p.last.toFixed(2)}</span></div><div class="meta">OI ${fmtInt(p.oi)} · vol ${fmtInt(p.vol)} · IV ${p.iv??'–'}% · ${p.dte}d · needs <b>${side==='calls'?'+':'−'}${Math.round(p.be)}%</b> to B/E</div></div>`;
+    play=`<div class="play"><div class="code">${esc(code(o.t,p))}</div><div class="quote"><b>${p.bid.toFixed(2)}</b> × <b>${p.ask.toFixed(2)}</b><span class="dim"> last ${p.last.toFixed(2)}</span></div><div class="meta">OI ${fmtInt(p.oi)} · vol ${fmtInt(p.vol)} · IV ${p.iv??'–'}%${o.iv_rank!=null?' <span class="'+(o.iv_rank>=60?'warn':'')+'" title="'+(o.ivr_src==='iv'?'rank in our own IV log':'realized-vol percentile (proxy until 20 days of IV are logged)')+'" style="white-space:nowrap">rk '+o.iv_rank+'</span>':''} · ${p.dte}d · needs <b>${side==='calls'?'+':'−'}${Math.round(p.be)}%</b> to B/E</div><button class="took${tookIt(o)?' on':''}" data-t="${esc(o.t)}" title="Log this as a paper trade">${tookIt(o)?'✓ Logged':'Took it'}</button></div>`;
     if(o.alts&&o.alts.length)alts=`<div class="alts"><span class="lbl">Also</span>${o.alts.map(a=>`<span>${esc(code(o.t,a))} <em>${a.bid.toFixed(2)}×${a.ask.toFixed(2)}</em> OI ${fmtInt(a.oi)}</span>`).join(' ')}</div>`;
   } else play=`<div class="play none">${o.err?'Data error: '+esc(o.err):SIDES[side].none}</div>`;
-  return `<article class="pick${p?'':' watch'}">
+  const det=detail(o);
+  return `<article class="pick${p?'':' watch'}" data-t="${esc(o.t)}">
   <div class="rank">${i}</div>
-  <div class="name"><div class="tick"><a href="https://finviz.com/quote.ashx?t=${esc(o.t)}" target="_blank" rel="noopener">${esc(o.t)}</a><span class="px">${money(o.px)}</span></div><div class="co">${esc(o.co)}</div><div class="flags">${flags}</div></div>
+  <div class="name"><div class="tick"><a href="https://finviz.com/quote.ashx?t=${esc(o.t)}" target="_blank" rel="noopener">${esc(o.t)}</a><span class="px">${money(o.px)}</span></div><div class="co">${esc(o.co)}${o.pm_px?`<br><span class="mono ${o.pm_chg>0?'good':'warn'}">pre-mkt ${money(o.pm_px)} (${o.pm_chg>0?'+':''}${o.pm_chg}%)</span>`:''}</div><div class="flags">${flags}</div></div>
   <div class="chart">${spark(o.closes)}<div class="cap">30d · ${o.up3d>0?'+':''}${o.up3d??'–'}% last 3</div></div>
   <dl class="stats">${side==='calls'?`
     <div><dt>Short float</dt><dd class="hot">${(o.sf??0).toFixed(1)}%</dd></div>
     <div><dt>Days to cover</dt><dd>${(o.sr??0).toFixed(1)}</dd></div>
     <div><dt>RSI 14</dt><dd class="${up?'good':'warn'}">${Math.round(o.rsi??0)} <small>${up?'▲':'▼'} from ${Math.round(o.rsi3??0)}</small></dd></div>
     <div><dt>Off 52-wk low</dt><dd>${o.lo52==null?'–':(o.lo52>0?'+':'')+Math.round(o.lo52)+'%'}</dd></div>
-    <div><dt>Off 20-day low</dt><dd>+${(o.low20??0).toFixed(1)}%</dd></div>
+    <div><dt>Borrow fee</dt><dd class="${o.borrow&&o.borrow.fee>=20?'hot':''}">${o.borrow?o.borrow.fee.toFixed(1)+'%':'–'} <small>${o.borrow?fmtInt(o.borrow.avail)+' avail':'no data'}</small></dd></div>
     <div><dt>Vol vs 20d</dt><dd class="${o.vr>=1.3?'good':''}">${(o.vr??0).toFixed(2)}×</dd></div>`:`
     <div><dt>Run 5d / 10d</dt><dd class="hot">+${Math.round(o.pw??0)}% / +${Math.round(o.p10??0)}%</dd></div>
     <div><dt>Above 20-day avg</dt><dd>${(o.s20??0)>0?'+':''}${Math.round(o.s20??0)}%</dd></div>
@@ -182,15 +195,32 @@ function row(i,o){
   <div class="score"><div class="num">${Math.round(o.score)}</div>
     <div class="bar" title="fuel ${o.fuel} · bottom ${o.bot} · contract ${o.opt}"><i class="f" style="width:${o.fuel}%"></i><i class="b" style="width:${o.bot}%"></i><i class="o" style="width:${o.opt}%"></i></div>
     <div class="legend"><span><i class="f"></i>${SIDES[side].legend[0]} ${Math.round(o.fuel)}</span><span><i class="b"></i>${SIDES[side].legend[1]} ${Math.round(o.bot)}</span><span><i class="o"></i>${SIDES[side].legend[2]} ${Math.round(o.opt)}</span></div></div>
+  <div class="detail">${det}</div>
 </article>`;
 }
+function detail(o){
+  const kv=(k,v)=>`<div><span class="k">${k}</span>${v??'–'}</div>`;
+  const out=[];
+  out.push(kv('Avg volume',fmtInt(Math.round(o.av||0))),kv('Market cap',o.mc?'$'+(o.mc/1e6).toFixed(0)+'M':'–'),kv('52-wk range',`${o.lo52!=null?(o.lo52>0?'+':'')+Math.round(o.lo52)+'% off low':'–'} · ${o.hi52!=null?Math.round(o.hi52)+'% off high':'–'}`));
+  out.push(kv('Earnings',o.earn&&o.earn!=='-'?o.earn+(o.earn_in?' <b class="warn">inside contract window</b>':''):'none scheduled'));
+  out.push(kv('Borrow (IBKR)',o.borrow?`${o.borrow.fee}% fee · ${fmtInt(o.borrow.avail)} shares available`:'no data'));
+  out.push(kv('IV rank',o.iv_rank!=null?`${o.iv_rank} <small>(${o.ivr_src==='iv'?'own IV log':'realized-vol proxy'})</small>${o.atm_iv?' · ATM IV '+o.atm_iv+'%':''}`:'–'));
+  out.push(kv('SEC filings',(o.dil&&o.dil.length?o.dil.map(d=>d[0]+' '+d[1]).join(', '):'no shelf/offering in 120d')+(o.k8?' · 8-K '+o.k8:'')));
+  if(side==='puts'){out.push(kv('Cash runway',o.runway!=null?o.runway+' yrs at current burn':'–'),kv('Days since IPO',o.ipo_days??'–'));}
+  if(o.alts&&o.alts.length)out.push(kv('Other contracts',o.alts.map(a=>`${esc(code(o.t,a))} ${a.bid.toFixed(2)}×${a.ask.toFixed(2)} OI ${fmtInt(a.oi)} · needs ${Math.round(a.be)}%`).join('<br>')));
+  const tr=trackFor(o); if(tr)out.push(kv('What happened next',`stock +5d ${fmt(tr.r5)} · +10d ${fmt(tr.r10)} · +20d ${fmt(tr.r20)} · best ${fmt(tr.best)} · option ${tr.mark!=null?'$'+tr.mark.toFixed(2)+' ('+(tr.opt_ret>0?'+':'')+tr.opt_ret+'%)':'–'} · <b>${tr.status}</b>`));
+  return out.join('');
+}
+const fmt=x=>x==null?'–':(x>0?'+':'')+x+'%';
 function render(d){
   const tradeable=d.top.filter(o=>o.play).length+d.rest.filter(r=>r[5]).length;
   const S=SIDES[side]; $('#eyebrow').textContent=S.eyebrow; document.title='Luck Society Option Scanner · '+(side==='calls'?'Calls':'Puts');
   $('#funnel').innerHTML=`<div><b>${d.universe}</b><span>${S.f1}</span></div><div><b>${d.pass1}</b><span>${S.f2}</span></div><div><b>${d.deep}</b><span>${S.f3}</span></div><div><b>${tradeable}</b><span>${S.f4}</span></div>`;
   $('#main').innerHTML=`
-  <div class="rule"><h2>Ranked ${side==='calls'?'call':'put'} plays</h2><p>${S.rule}</p></div>
+  ${trackPanel()}
+  <div class="rule"><h2>Ranked ${side==='calls'?'call':'put'} plays${histDate?` <span class="hist">· ${histDate}</span>`:''}</h2><p>${S.rule}</p></div>
   ${d.top.map((o,i)=>row(i+1,o)).join('')}
+  ${tradesPanel()}
   <div class="rule"><h2>Watchlist</h2><p>${S.watch}</p></div>
   <div class="twrap"><table><thead><tr><th>Ticker</th><th>Price</th><th>Short float</th><th>RSI</th><th>Score</th><th>${side==='calls'?'Call ≤ $0.25':'Put ≤ $0.35'}</th></tr></thead><tbody>
   ${d.rest.map(r=>`<tr><td class="t"><a href="https://finviz.com/quote.ashx?t=${esc(r[0])}" target="_blank" rel="noopener">${esc(r[0])}</a></td><td>${money(r[1])}</td><td class="hot">${(r[2]??0).toFixed(1)}%</td><td>${Math.round(r[3]??0)}</td><td>${Math.round(r[4]??0)}</td><td>${r[5]?'yes':'<span class="dim">none</span>'}</td></tr>`).join('')}
@@ -199,9 +229,66 @@ function render(d){
     <div><h3>${S.m1[0]}</h3><p>${S.m1[1]}</p></div>
     <div><h3>${S.m2[0]}</h3><p>${S.m2[1]}</p></div>
     <div><h3>${S.m3[0]}</h3><p>${S.m3[1]}</p></div>
+    <div><h3>Track record</h3><p>Every evening the tracker re-checks past picks: a <b>hit</b> means the contract is (or expired) worth 2× the entry ask, or the stock reached its breakeven within 20 sessions; a <b>bust</b> means it expired worthless or is down 70%+ with under 5 days left. Hit-rate is hits ÷ (hits + busts); open picks are not counted yet. Treat anything under ~30 decided picks as noise.</p></div>
+    <div><h3>Extras on each card</h3><p>Click a card to expand it: borrow fee and shares available (Interactive Brokers via iBorrowDesk), IV rank (our own daily IV log once it has 20 days, realized-vol percentile until then — rank ≥ 60 costs the contract 2 pts, ≥ 80 costs 4), pre-market quote when the scan runs before the open, earnings inside the contract window (−8 pts, flagged red), recent 8-K and shelf filings. "Took it" logs a paper trade in this browser and the tracker fills in what happened.</p></div>
   </section>
   <p class="caveat">Quotes from Yahoo Finance at scan time; outside market hours bids often show 0.00 and the last trade is the better guide. Both boards run a full screen each morning; quotes and scores refresh every 5 minutes through the close, and this page checks for new data every 60 seconds. Screening tool, not a recommendation — check the chain, news and pending earnings before entering.</p>`;
 }
+// ---- track record / history / paper trades
+let track=null, trackDay=null, histDate='';
+function trackPanel(){
+  const s=track&&track.sides&&track.sides[side]; if(!s)return '';
+  const B=s.buckets, order=['70+','60-69','50-59','<50'];
+  const cell=n=>{const b=B[n]||{};return `<div class="${b.hit_rate!=null?(b.hit_rate>=50?'hi':(b.hit_rate<30?'lo':'')):''}"><span class="k">Score ${n}</span><b>${b.hit_rate!=null?b.hit_rate+'%':'–'}</b><small>${b.hit||0} hit · ${b.bust||0} bust · ${b.open||0} open${b.avg_best!=null?' · best '+fmt(b.avg_best):''}</small></div>`};
+  return `<div class="rule"><h2>Track record</h2><p>${s.picks} picks over ${s.days} scan days (${s.first} → ${s.last}). Hit-rate by score bucket — definitions in the notes at the bottom.</p></div><div class="track">${order.map(cell).join('')}</div>`;
+}
+function trackFor(o){
+  if(!trackDay)return null; const p=o.play; if(!p)return null;
+  return trackDay.find(r=>r.t===o.t&&r.exp===p.exp&&Math.abs(r.strike-p.strike)<1e-6)||null;
+}
+async function loadTrack(){
+  try{const r=await fetch('data/track/summary.json?t='+Date.now(),{cache:'no-store'});track=r.ok?await r.json():null;}catch{track=null}
+}
+async function loadTrackDay(date){
+  trackDay=null; if(!date)return;
+  try{const r=await fetch(`data/track/${side}/${date}.json?t=`+Date.now(),{cache:'no-store'});if(r.ok)trackDay=await r.json();}catch{}
+}
+const TR='squeeze.trades';
+function trades(){try{return JSON.parse(localStorage.getItem(TR)||'[]')}catch{return []}}
+function saveTrades(t){try{localStorage.setItem(TR,JSON.stringify(t))}catch{}}
+function tradeId(o){const p=o.play;return `${side}:${o.t}:${p.exp}:${p.strike}`}
+function tookIt(o){return o.play&&trades().some(t=>t.id===tradeId(o))}
+function toggleTrade(o){
+  const all=trades(), id=tradeId(o), i=all.findIndex(t=>t.id===id);
+  if(i>=0){all.splice(i,1);saveTrades(all);toast('Removed from my trades');}
+  else{const p=o.play;all.push({id,side,t:o.t,code:code(o.t,p),exp:p.exp,strike:p.strike,entry:p.ask,px0:o.px,scan:(current&&current.full_asof||'').slice(0,10),score:o.score,when:new Date().toISOString()});saveTrades(all);toast('Logged as a paper trade');}
+}
+let openAll=null;
+async function loadOpen(){try{const r=await fetch('data/track/open.json?t='+Date.now(),{cache:'no-store'});openAll=r.ok?await r.json():null;}catch{openAll=null}}
+function tradesPanel(){
+  const mine=trades().filter(t=>t.side===side); if(!mine.length)return '';
+  const rows=mine.map(t=>{
+    const tr=(openAll||[]).find(r=>r.t===t.t&&r.side===t.side&&r.exp===t.exp&&Math.abs(r.strike-t.strike)<1e-6&&r.scan===t.scan);
+    const mark=tr&&tr.mark!=null?tr.mark:null, pl=mark!=null&&t.entry?Math.round((mark/t.entry-1)*100):null;
+    return `<tr><td class="t">${esc(t.code)}</td><td>${t.scan||'–'}</td><td>$${Number(t.entry).toFixed(2)}</td><td>${mark!=null?'$'+mark.toFixed(2):'<span class="dim">tracker runs after close</span>'}</td><td class="pl ${pl==null?'':(pl>=0?'up':'dn')}">${pl==null?'–':(pl>0?'+':'')+pl+'%'}</td><td>${tr?tr.status:'–'}</td><td><button data-rm="${t.id}">remove</button></td></tr>`;}).join('');
+  return `<div class="rule"><h2>My trades</h2><p>Paper trades you logged with "Took it" (stored in this browser only). Marks come from the nightly tracker.</p></div>
+  <div class="twrap"><table class="trades"><thead><tr><th>Contract</th><th>Scan day</th><th>Entry</th><th>Mark</th><th>P/L</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+async function loadHistIndex(){
+  const sel=$('#histSel'); sel.innerHTML='<option value="">Latest</option>';
+  try{const r=await fetch(`data/${side==='calls'?'':'puts/'}history/index.json?t=`+Date.now(),{cache:'no-store'});if(!r.ok)return;
+    const days=await r.json(); days.slice().reverse().forEach(d=>{const o=document.createElement('option');o.value=d;o.textContent=d;sel.appendChild(o);});
+  }catch{}
+}
+$('#histSel').onchange=async e=>{histDate=e.target.value; if(!histDate){lastAsof=null;load(false);return;}
+  try{const r=await fetch(`data/${side==='calls'?'':'puts/'}history/${histDate}.json?t=`+Date.now(),{cache:'no-store'});const d=await r.json();await loadTrackDay(histDate);current=d;lastAsof=d.asof;render(d);paintAge();}catch{toast('Could not load '+histDate)}
+};
+document.addEventListener('click',e=>{
+  const rm=e.target.closest('button[data-rm]'); if(rm){const all=trades().filter(t=>t.id!==rm.dataset.rm);saveTrades(all);if(current)render(current);return;}
+  const tk=e.target.closest('button.took'); if(tk){const o=current.top.find(x=>x.t===tk.dataset.t);if(o){toggleTrade(o);render(current);}return;}
+  if(e.target.closest('a,button,select'))return;
+  const card=e.target.closest('.pick'); if(card)card.classList.toggle('open');
+});
 // ---- data age + polling
 let lastAsof=null, current=null;
 function fmtAge(iso){
@@ -217,20 +304,22 @@ function paintAge(){
   $('#modeText').textContent=`· ${current.mode==='full'?'full scan':'quote refresh'} · screen from ${full} ET`;
 }
 async function load(manual){
+  if(histDate&&!manual)return;
   try{
+    if(!track)await loadTrack(); if(!openAll)await loadOpen();
     let r=null;
     for(const p of [SIDES[side].path]){
       try{ r=await fetch(p+'?t='+Date.now(),{cache:'no-store'}); if(r.ok)break; }catch(e){ r=null; }
     }
     if(!r||!r.ok)throw new Error('no data file');
     const d=await r.json();
-    if(d.asof!==lastAsof){ current=d; lastAsof=d.asof; render(d); if(manual)toast('Updated'); }
+    if(d.asof!==lastAsof){ current=d; lastAsof=d.asof; await loadTrackDay((d.full_asof||'').slice(0,10)); render(d); if(manual)toast('Updated'); }
     else if(manual)toast('No new data yet');
     paintAge();
   }catch(e){ if(!current)$('#main').innerHTML=`<div class="empty">No ${side==='calls'?'call':'put'} scan results yet. Run the <b>Luck Society Option Scanner</b> workflow in GitHub Actions once (or press Scan now after connecting) and this page will pick it up.</div>`; $('#ageText').textContent='no data'; }
 }
-$('#refreshBtn').onclick=()=>load(true);
-function setSide(sd){side=sd;try{localStorage.setItem('squeeze.side',sd)}catch{};$('#sideCalls').classList.toggle('on',sd==='calls');$('#sidePuts').classList.toggle('on',sd==='puts');lastAsof=null;current=null;$('#main').innerHTML='<div class="empty">Loading…</div>';load(false);}
+$('#refreshBtn').onclick=()=>{if(histDate){histDate='';$('#histSel').value='';}track=null;openAll=null;lastAsof=null;load(true);};
+function setSide(sd){side=sd;try{localStorage.setItem('squeeze.side',sd)}catch{};$('#sideCalls').classList.toggle('on',sd==='calls');$('#sidePuts').classList.toggle('on',sd==='puts');lastAsof=null;current=null;histDate='';$('#histSel').value='';$('#main').innerHTML='<div class="empty">Loading…</div>';loadHistIndex();load(false);}
 $('#sideCalls').onclick=()=>setSide('calls');$('#sidePuts').onclick=()=>setSide('puts');setSide(side);
 setInterval(()=>load(false),60000); setInterval(paintAge,15000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)load(false);});
@@ -254,4 +343,3 @@ let tt;function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('sh
 </script>
 </body>
 </html>
-
