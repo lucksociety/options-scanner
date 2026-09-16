@@ -31,7 +31,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 ET = ZoneInfo("America/New_York")
 ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT = ROOT / "data"
-SEC_UA = {"User-Agent": "LuckSocietyOptionScanner/1.0 (github.com/lucksociety/options-scanner)"}
+SEC_UA = {"User-Agent": "LuckSocietyOptionScanner/1.0 (lucksociety@users.noreply.github.com)",   # SEC fair-access policy wants name + contact
+          "Accept-Encoding": "gzip, deflate", "Accept": "application/json, text/plain, */*"}
 
 CFG = {
     "calls": dict(price_min=1.0, price_max=10.0, si_min=15.0, avgvol_min=300_000, deep_n=40,
@@ -90,8 +91,13 @@ def edgar_recent(t):
     global _cik
     try:
         if _cik is None:
-            r = requests.get("https://www.sec.gov/files/company_tickers.json", headers=SEC_UA, timeout=20); r.raise_for_status()
-            _cik = {v["ticker"].upper(): v["cik_str"] for v in r.json().values()}
+            r = requests.get("https://www.sec.gov/files/company_tickers.json", headers=SEC_UA, timeout=20)
+            if r.status_code == 200:
+                _cik = {v["ticker"].upper(): v["cik_str"] for v in r.json().values()}
+            else:   # fallback: plain-text ticker<TAB>cik list
+                r = requests.get("https://www.sec.gov/include/ticker.txt", headers=SEC_UA, timeout=20); r.raise_for_status()
+                _cik = {a.upper(): int(b) for a, b in (ln.split("\t") for ln in r.text.strip().splitlines() if "\t" in ln)}
+            time.sleep(0.2)
         cik = _cik.get(t.upper())
         if not cik: return None, None
         r = requests.get(f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json", headers=SEC_UA, timeout=20); r.raise_for_status()
@@ -109,15 +115,18 @@ def edgar_dilution(t):
     return edgar_recent(t)[0]
 
 def borrow_info(t):
-    """iBorrowDesk (Interactive Brokers stock-loan data): borrow fee % and shares available. Free, no key."""
+    """iBorrowDesk (Interactive Brokers stock-loan data): borrow fee % and shares available. Free, no key. Needs the www. host."""
     try:
-        r = requests.get(f"https://iborrowdesk.com/api/ticker/{t}", headers={"User-Agent": SEC_UA["User-Agent"]}, timeout=15)
+        r = requests.get(f"https://www.iborrowdesk.com/api/ticker/{t}", headers={"User-Agent": SEC_UA["User-Agent"], "Accept": "application/json"}, timeout=15)
         if r.status_code != 200: return None
-        j = r.json(); rows = j.get("real_time") or j.get("daily") or []
-        if not rows: return None
-        last = rows[-1] if isinstance(rows, list) else rows
-        fee = float(last.get("fee") or 0); avail = int(float(last.get("available") or 0))
-        return dict(fee=round(fee, 1), avail=avail, asof=str(last.get("date") or last.get("time") or "")[:16])
+        j = r.json()
+        fee, avail, asof = j.get("latest_fee"), j.get("latest_available"), str(j.get("updated") or "")[:16]
+        if fee is None:
+            rows = j.get("real_time") or j.get("daily") or []
+            if not rows: return None
+            last = rows[-1]; fee = last.get("fee"); avail = last.get("available"); asof = str(last.get("datetime") or last.get("date") or "")[:16]
+        if fee is None: return None
+        return dict(fee=round(float(fee), 1), avail=int(float(avail or 0)), asof=asof)
     except Exception as e:
         log.debug("borrow %s: %s", t, e); return None
 
@@ -489,4 +498,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
