@@ -132,11 +132,19 @@ def edgar_recent(t):
 def edgar_dilution(t):
     return edgar_recent(t)[0]
 
+BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/140.0.0.0 Safari/537.36")
+_borrow_note = [0]     # log the first failure reason once instead of 40 silent misses
 def borrow_info(t):
-    """iBorrowDesk (Interactive Brokers stock-loan data): borrow fee % and shares available. Free, no key. Needs the www. host."""
+    """iBorrowDesk (Interactive Brokers stock-loan data): borrow fee % and shares available. Free, no key.
+    Needs the www. host AND a browser User-Agent — Cloudflare 403s unknown agents."""
     try:
-        r = requests.get(f"https://www.iborrowdesk.com/api/ticker/{t}", headers={"User-Agent": SEC_UA["User-Agent"], "Accept": "application/json"}, timeout=15)
-        if r.status_code != 200: return None
+        r = requests.get(f"https://www.iborrowdesk.com/api/ticker/{t}",
+                         headers={"User-Agent": BROWSER_UA, "Accept": "application/json, text/plain, */*",
+                                  "Referer": f"https://www.iborrowdesk.com/report/{t}"}, timeout=15)
+        if r.status_code != 200:
+            if not _borrow_note[0]: _borrow_note[0] = 1; log.warning("borrow: %s -> HTTP %s", t, r.status_code)
+            return None
         j = r.json()
         fee, avail, asof = j.get("latest_fee"), j.get("latest_available"), str(j.get("updated") or "")[:16]
         if fee is None:
@@ -146,7 +154,24 @@ def borrow_info(t):
         if fee is None: return None
         return dict(fee=round(float(fee), 1), avail=int(float(avail or 0)), asof=asof)
     except Exception as e:
-        log.debug("borrow %s: %s", t, e); return None
+        if not _borrow_note[0]: _borrow_note[0] = 1; log.warning("borrow: %s -> %s", t, e)
+        return None
+
+def share_growth(t):
+    """Realized dilution straight from Yahoo: % change in shares outstanding over ~6 months.
+    Replaces the SEC shelf-filing signal, which is unreachable from GitHub runners (sec.gov 403s their IPs).
+    Measures dilution that actually happened rather than dilution a company is merely allowed to do."""
+    try:
+        end = datetime.now(timezone.utc); start = end - timedelta(days=200)
+        ser = yf.Ticker(t).get_shares_full(start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"))
+        if ser is None or len(ser) < 2: return None
+        ser = ser.dropna()
+        if len(ser) < 2: return None
+        first, last = float(ser.iloc[0]), float(ser.iloc[-1])
+        if first <= 0: return None
+        return round((last / first - 1) * 100, 1)
+    except Exception as e:
+        log.debug("shares %s: %s", t, e); return None
 
 def hv_percentile(cl, n=20):
     """Where today's 20-day realized vol sits in its 1-year range (0-100). Proxy for IV rank until our own IV log is long enough."""
@@ -231,6 +256,7 @@ def stage1_calls():
     for x in top:
         x["borrow"] = borrow_info(x["t"]); time.sleep(0.2)
         x["dil"], x["k8"] = edgar_recent(x["t"])
+        x["shrg"] = share_growth(x["t"])
     log.info("calls stage1: universe=%d pass=%d deep=%d · borrow %d/%d, filings %d/%d", len(rows), len(keep), len(top),
              sum(1 for x in top if x.get("borrow")), len(top), sum(1 for x in top if x.get("dil") is not None), len(top))
     return len(rows), len(keep), top
@@ -305,9 +331,11 @@ def stage1_puts():
         time.sleep(0.1)
     for x in top:
         x["dil"], x["k8"] = edgar_recent(x["t"])
+        x["shrg"] = share_growth(x["t"])
         x["borrow"] = borrow_info(x["t"]); time.sleep(0.2)
-    log.info("puts stage1: universe=%d pass=%d deep=%d · borrow %d/%d, filings %d/%d", len(syms), len(keep), len(top),
-             sum(1 for x in top if x.get("borrow")), len(top), sum(1 for x in top if x.get("dil") is not None), len(top))
+    log.info("puts stage1: universe=%d pass=%d deep=%d · borrow %d/%d, filings %d/%d, share-count %d/%d", len(syms), len(keep), len(top),
+             sum(1 for x in top if x.get("borrow")), len(top), sum(1 for x in top if x.get("dil") is not None), len(top),
+             sum(1 for x in top if x.get("shrg") is not None), len(top))
     return len(syms), len(keep), top
 
 # --------------------------------------------------------------------------- stage 2 · deep scan (both sides)
@@ -400,6 +428,7 @@ def deep(x, side):
             if o["vr"] >= 1.3: flags.append(f"volume pickup {o['vr']}x")
             if b.get("fee") is not None and b["fee"] >= 20: flags.append(f"borrow fee {b['fee']}%")
             if b.get("avail") is not None and b["avail"] < 100_000: flags.append(f"{b['avail']:,} shares to borrow")
+            if (x.get("shrg") or 0) >= 15: s -= 3; flags.append(f"shares +{x['shrg']}% in 6mo")   # they keep printing stock
             o.update(fuel=round(fuel, 1), bot=bot)
         else:
             o["rsiDown"] = o["rsi"] < o["rsi3"]
@@ -413,6 +442,8 @@ def deep(x, side):
             if x.get("runway") is not None and x["runway"] < 1: press += 6
             elif x.get("runway") is not None and x["runway"] < 2: press += 3
             if x.get("dil"): press += 6
+            elif (x.get("shrg") or 0) >= 10: press += 6          # share count actually ballooned
+            elif (x.get("shrg") or 0) >= 5: press += 3
             if x.get("ipo_days") is not None and 150 <= x["ipo_days"] <= 200: press += 4
             press = min(press, 35)
             top_ = 0
@@ -433,6 +464,7 @@ def deep(x, side):
             if o["volFade"]: flags.append("volume fading")
             if x.get("gapfail"): flags.append(f"failed gap (+{x['gapfail']}%)")
             if x.get("dil"): flags.append("dilution: " + ", ".join(f"{f} {d}" for f, d in x["dil"][:2]))
+            elif (x.get("shrg") or 0) >= 5: flags.append(f"shares +{x['shrg']}% in 6mo")
             if x.get("runway") is not None and x["runway"] < 1: flags.append(f"cash runway {x['runway']}y")
             if x.get("ipo_days") is not None and 150 <= x["ipo_days"] <= 200: flags.append("lockup window")
             o.update(fuel=round(press, 1), bot=top_)
@@ -468,7 +500,7 @@ def _clean(v):
 
 def assemble(side, mode, universe, pass1, top_in, deep_out, full_asof):
     keys = ("t","co","px","sf","sr","rsi","rsi3","lo","hi","low20","high20","up3d","vr","pq","pm","pw","p10","s20","av","mc","earn",
-            "runway","dil","ipo_days","gapfail","borrow","k8","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
+            "runway","dil","ipo_days","gapfail","borrow","k8","shrg","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
             "fuel","bot","opt","score","flags","play","alts","closes","err")
     top = [{k: o.get(k) for k in keys} for o in deep_out[:16]]
     for o in top: o["lo52"] = o.pop("lo"); o["hi52"] = o.pop("hi")
