@@ -85,21 +85,39 @@ def has_options(t):
     try: return bool(yf.Ticker(t).options)
     except Exception: return False
 
-_cik = None
+_cik = None          # None = not loaded yet; {} = SEC unreachable from this runner, stop trying
+def _load_cik():
+    """Ticker -> CIK map. SEC blocks some cloud IPs outright; if so we give up once instead of per-ticker."""
+    global _cik
+    if _cik is not None: return _cik
+    for url, parse in (("https://www.sec.gov/files/company_tickers.json",
+                        lambda r: {v["ticker"].upper(): v["cik_str"] for v in r.json().values()}),
+                       ("https://www.sec.gov/include/ticker.txt",
+                        lambda r: {a.upper(): int(b) for a, b in (ln.split("\t") for ln in r.text.strip().splitlines() if "\t" in ln)})):
+        try:
+            r = requests.get(url, headers=SEC_UA, timeout=20)
+            if r.status_code == 200:
+                _cik = parse(r); log.info("edgar: loaded %d CIKs", len(_cik)); return _cik
+            log.warning("edgar: %s -> HTTP %s", url.rsplit("/", 1)[-1], r.status_code)
+        except Exception as e:
+            log.warning("edgar: %s -> %s", url.rsplit("/", 1)[-1], e)
+        time.sleep(0.5)
+    # Diagnose once: is data.sec.gov reachable even though www.sec.gov isn't? (CIK 1318605 = Tesla)
+    try:
+        probe = requests.get("https://data.sec.gov/submissions/CIK0001318605.json", headers=SEC_UA, timeout=20)
+        log.warning("edgar: ticker map unavailable; data.sec.gov probe -> HTTP %s", probe.status_code)
+    except Exception as e:
+        log.warning("edgar: ticker map unavailable; data.sec.gov probe -> %s", e)
+    _cik = {}
+    return _cik
+
 def edgar_recent(t):
     """SEC filings that matter: shelf/offering forms in the last 120 days (dilution) and 8-Ks in the last 5 days (news catalyst)."""
-    global _cik
+    cikmap = _load_cik()
+    if not cikmap: return None, None            # SEC unreachable from this runner — skip silently
+    cik = cikmap.get(t.upper())
+    if not cik: return None, None
     try:
-        if _cik is None:
-            r = requests.get("https://www.sec.gov/files/company_tickers.json", headers=SEC_UA, timeout=20)
-            if r.status_code == 200:
-                _cik = {v["ticker"].upper(): v["cik_str"] for v in r.json().values()}
-            else:   # fallback: plain-text ticker<TAB>cik list
-                r = requests.get("https://www.sec.gov/include/ticker.txt", headers=SEC_UA, timeout=20); r.raise_for_status()
-                _cik = {a.upper(): int(b) for a, b in (ln.split("\t") for ln in r.text.strip().splitlines() if "\t" in ln)}
-            time.sleep(0.2)
-        cik = _cik.get(t.upper())
-        if not cik: return None, None
         r = requests.get(f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json", headers=SEC_UA, timeout=20); r.raise_for_status()
         f = r.json()["filings"]["recent"]; now = datetime.now(timezone.utc)
         c120 = (now - timedelta(days=120)).strftime("%Y-%m-%d"); c5 = (now - timedelta(days=5)).strftime("%Y-%m-%d")
@@ -213,7 +231,8 @@ def stage1_calls():
     for x in top:
         x["borrow"] = borrow_info(x["t"]); time.sleep(0.2)
         x["dil"], x["k8"] = edgar_recent(x["t"])
-    log.info("calls stage1: universe=%d pass=%d deep=%d", len(rows), len(keep), len(top))
+    log.info("calls stage1: universe=%d pass=%d deep=%d · borrow %d/%d, filings %d/%d", len(rows), len(keep), len(top),
+             sum(1 for x in top if x.get("borrow")), len(top), sum(1 for x in top if x.get("dil") is not None), len(top))
     return len(rows), len(keep), top
 
 # --------------------------------------------------------------------------- stage 1 · puts
@@ -287,7 +306,8 @@ def stage1_puts():
     for x in top:
         x["dil"], x["k8"] = edgar_recent(x["t"])
         x["borrow"] = borrow_info(x["t"]); time.sleep(0.2)
-    log.info("puts stage1: universe=%d pass=%d deep=%d", len(syms), len(keep), len(top))
+    log.info("puts stage1: universe=%d pass=%d deep=%d · borrow %d/%d, filings %d/%d", len(syms), len(keep), len(top),
+             sum(1 for x in top if x.get("borrow")), len(top), sum(1 for x in top if x.get("dil") is not None), len(top))
     return len(syms), len(keep), top
 
 # --------------------------------------------------------------------------- stage 2 · deep scan (both sides)
