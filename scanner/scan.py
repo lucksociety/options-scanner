@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-Luck Society Option Scanner — two sides, one engine.
+Luck Society Option Scanner — three boards, one engine.
 
-  calls  Heavily shorted, sub-$10 stocks that look bottomed → best OTM call ≤ $0.25, 2–6 weeks out.
-  puts   Overextended $5–$30 stocks with a forced seller behind them (trapped momentum buyers, dilution,
-         lockup expiry) that look like they're topping → best OTM put ≤ $0.35, 3–6 weeks out.
+  calls     Heavily shorted, sub-$10 stocks that look bottomed → best OTM call ≤ $0.25, 2–6 weeks out.
+  breakout  The same heavily shorted, sub-$10 universe, but already turned: higher highs, above the 20/50-day,
+            coiling or pressing the 20-day high on rising volume → best OTM call ≤ $0.25.
+  puts      Overextended $5–$30 stocks with a forced seller behind them (trapped momentum buyers, dilution,
+            lockup expiry) that look like they're topping → best OTM put ≤ $0.35, 3–6 weeks out.
 
 Usage:  python scanner/scan.py <mode> [side]
-  mode   full | refresh | auto      (auto: full first run after 08:25 ET, refresh until 16:10 ET, else skip)
-  side   calls | puts | both        (default both)
+  mode   full | refresh | auto              (auto: full first run after 08:25 ET, refresh until 16:10 ET, else skip)
+  side   calls | puts | breakout | both     (default both = all three)
 
 Data: Yahoo Finance via yfinance (screener, batched history, key stats, option chains) + SEC EDGAR (filings)
       + iBorrowDesk (borrow fee / shares available, Interactive Brokers data) + our own daily IV log (data/iv/).
-Output: data/latest.json (calls), data/puts/latest.json (puts), plus data/<side>/history/YYYY-MM-DD.json after a full scan.
+Output: data/latest.json (calls), data/<side>/latest.json for the others, plus data/<side>/history/YYYY-MM-DD.json after a full scan.
 """
 import json, os, re, sys, time, math, logging
 from datetime import datetime, timezone, timedelta
@@ -34,9 +36,14 @@ DATA_ROOT = ROOT / "data"
 SEC_UA = {"User-Agent": "LuckSocietyOptionScanner/1.0 (lucksociety@users.noreply.github.com)",   # SEC fair-access policy wants name + contact
           "Accept-Encoding": "gzip, deflate", "Accept": "application/json, text/plain, */*"}
 
+SIDES = ("calls", "puts", "breakout")
+
 CFG = {
     "calls": dict(price_min=1.0, price_max=10.0, si_min=15.0, avgvol_min=300_000, deep_n=40,
                   min_dte=14, max_dte=45, max_ask=0.25, min_oi=25, max_be=60.0),
+    # same universe as calls (heavily shorted and cheap) but timed off momentum instead of a bottom
+    "breakout": dict(price_min=1.0, price_max=10.0, si_min=15.0, avgvol_min=300_000, deep_n=40,
+                     min_dte=14, max_dte=45, max_ask=0.25, min_oi=25, max_be=50.0),
     "puts":  dict(price_min=3.0, price_max=50.0, si_max=15.0, avgvol_min=500_000, deep_n=40,
                   run5_min=15.0, run10_min=25.0, ext20_min=20.0, gap_min=12.0,       # "ran too far" triggers (any one) — RSI alone is NOT a ticket in
                   min_dte=21, max_dte=45, max_ask=0.35, min_oi=25, max_be=35.0),
@@ -262,13 +269,15 @@ def premarket(info):
     return None
 
 # --------------------------------------------------------------------------- stage 1 · calls
-def stage1_calls():
-    c = CFG["calls"]
+def stage1_calls(kind="calls"):
+    """One screen, two rankings: 'calls' wants the shorted names that have stopped falling,
+    'breakout' wants the shorted names that have already turned and are pressing highs."""
+    c = CFG[kind]
     q = EQ("and", [EQ("gt", ["short_percentage_of_float.value", c["si_min"]]),
                    EQ("btwn", ["intradayprice", c["price_min"], c["price_max"]]),
                    EQ("gt", ["avgdailyvol3m", c["avgvol_min"]]), EQ("eq", ["region", "us"])])
     quotes = screen(q, "short_percentage_of_float.value"); syms = [x["symbol"] for x in quotes]
-    log.info("calls screener: %d names", len(syms))
+    log.info("%s screener: %d names", kind, len(syms))
     if not syms: raise RuntimeError("screener returned nothing")
     hist = batch_history(syms); rows = []
     for x in quotes:
@@ -285,7 +294,7 @@ def stage1_calls():
                              hi=round((p / float(cl[-252:].max()) - 1) * 100, 2), lo=round((p / float(cl[-252:].min()) - 1) * 100, 2),
                              rsi=round(float(rs[-1]), 2), av=av, rv=round(float(vol[-1]) / (av or 1), 2), p=round(p, 2), earn="-",
                              hvp=hvp[0] if hvp else None, hv=hvp[1] if hvp else None, earn_ts=None))
-        except Exception as e: log.warning("calls stage1 %s: %s", t, e)
+        except Exception as e: log.warning("%s stage1 %s: %s", kind, t, e)
     for r in rows:
         try:
             info = yf.Ticker(r["t"]).info
@@ -300,15 +309,27 @@ def stage1_calls():
     keep = [x for x in rows if x["av"] >= c["avgvol_min"] and x["sf"] >= c["si_min"]]
     for x in keep:
         s = min(x["sf"], 60) / 60 * 35 + min(x["sr"] or 0, 10) / 10 * 10
-        if 25 <= x["rsi"] <= 45: s += 15
-        elif 45 < x["rsi"] <= 55: s += 8
-        elif x["rsi"] < 25: s += 5
-        if x["lo"] <= 25: s += 15
-        elif x["lo"] <= 50: s += 8
-        if (x["pq"] or 0) < -20: s += 8
-        if (x["pw"] or 0) > -3: s += 6
-        if (x["s20"] or 0) > 0: s += 6
-        if x["rv"] >= 1.2: s += 5
+        if kind == "calls":                                   # bottoming: beaten down, starting to turn
+            if 25 <= x["rsi"] <= 45: s += 15
+            elif 45 < x["rsi"] <= 55: s += 8
+            elif x["rsi"] < 25: s += 5
+            if x["lo"] <= 25: s += 15
+            elif x["lo"] <= 50: s += 8
+            if (x["pq"] or 0) < -20: s += 8
+            if (x["pw"] or 0) > -3: s += 6
+            if (x["s20"] or 0) > 0: s += 6
+            if x["rv"] >= 1.2: s += 5
+        else:                                                 # breakout: already moving, pressing highs
+            if 55 <= x["rsi"] <= 72: s += 15
+            elif 45 <= x["rsi"] < 55: s += 8
+            elif x["rsi"] > 72: s += 3
+            if (x["hi"] if x["hi"] is not None else -100) >= -15: s += 12
+            elif (x["hi"] if x["hi"] is not None else -100) >= -30: s += 6
+            if (x["s20"] or 0) > 0: s += 8
+            if (x["s50"] or 0) > 0: s += 6
+            if (x["pw"] or 0) > 3: s += 6
+            if x["rv"] >= 1.5: s += 8
+            elif x["rv"] >= 1.2: s += 4
         x["s1"] = round(s, 1)
     keep.sort(key=lambda x: -x["s1"])
     top = []
@@ -320,7 +341,7 @@ def stage1_calls():
         x["borrow"] = borrow_info(x["t"]); time.sleep(0.2)
         x["dil"], x["k8"] = edgar_recent(x["t"])
         x["shrg"] = share_growth(x["t"])
-    log.info("calls stage1: universe=%d pass=%d deep=%d · borrow %d/%d, filings %d/%d", len(rows), len(keep), len(top),
+    log.info("%s stage1: universe=%d pass=%d deep=%d · borrow %d/%d, filings %d/%d", kind, len(rows), len(keep), len(top),
              sum(1 for x in top if x.get("borrow")), len(top), sum(1 for x in top if x.get("dil") is not None), len(top))
     return len(rows), len(keep), top
 
@@ -479,7 +500,7 @@ def deep(x, side):
             ed = datetime.fromtimestamp(earn_ts, timezone.utc).date(); ex = datetime.strptime(o["play"]["exp"], "%Y-%m-%d").date()
             o["earn_in"] = datetime.now(timezone.utc).date() <= ed <= ex
         b = x.get("borrow") or {}
-        if side == "calls":
+        if side in ("calls", "breakout"):
             o["rsiUp"] = o["rsi"] > o["rsi3"]; o["wasOversold"] = min(rs[-10:]) < 35
             o["low20"] = round(float(cl[-1] / cl[-20:].min() - 1) * 100, 1)
             fpts, fm = float_pts(x.get("flt")); o["fltm"] = fm
@@ -495,18 +516,52 @@ def deep(x, side):
             if (o["si_chg"] or 0) >= 2: fuel += 2
             if (o["fee_chg"] or 0) >= 5: fuel += 2
             fuel = min(fuel, 35)
-            bot = 0
-            if 25 <= o["rsi"] <= 45: bot += 10
-            elif o["rsi"] < 25 or o["rsi"] <= 52: bot += 4
-            if o["rsiUp"]: bot += 10
-            if o["wasOversold"]: bot += 5
-            if o["low20"] <= 8 or (o["lo"] is not None and o["lo"] <= 15): bot += 5
-            if o["vr"] >= 1.3: bot += 5
-            if o["pm_chg"] is not None and 2 <= o["pm_chg"] <= 15: bot += 3
-            gpts, gflags = gamma_pts(o.get("gam")); bot = min(bot + gpts, 35); flags += gflags
-            setup = fuel + bot - (5 if o["up3d"] < -10 else 0)
-            if o["up3d"] < -10: flags.append(f"still falling ({o['up3d']}% / 3d)")
-            if o["rsiUp"]: flags.append("RSI turning up")
+            gpts, gflags = gamma_pts(o.get("gam")); flags += gflags
+            if side == "calls":
+                bot = 0
+                if 25 <= o["rsi"] <= 45: bot += 10
+                elif o["rsi"] < 25 or o["rsi"] <= 52: bot += 4
+                if o["rsiUp"]: bot += 10
+                if o["wasOversold"]: bot += 5
+                if o["low20"] <= 8 or (o["lo"] is not None and o["lo"] <= 15): bot += 5
+                if o["vr"] >= 1.3: bot += 5
+                if o["pm_chg"] is not None and 2 <= o["pm_chg"] <= 15: bot += 3
+                bot = min(bot + gpts, 35)
+                setup = fuel + bot - (5 if o["up3d"] < -10 else 0)
+                if o["up3d"] < -10: flags.append(f"still falling ({o['up3d']}% / 3d)")
+                if o["rsiUp"]: flags.append("RSI turning up")
+            else:
+                # Breakout timing: the trend has already turned — structure, location and volume, not oversold bounce.
+                o["hh"] = bool(hi[-10:].max() > hi[-20:-10].max() and lo[-10:].min() > lo[-20:-10].min())
+                s20v = float(cl[-20:].mean()); s50v = float(cl[-50:].mean()) if len(cl) >= 50 else s20v
+                o["above20"] = bool(cl[-1] > s20v); o["stack"] = bool(cl[-1] > s20v > s50v)
+                o["high20"] = round(float(cl[-1] / hi[-20:].max() - 1) * 100, 1)                 # % below 20-day high (≤ 0)
+                w1 = float(hi[-10:].max() - lo[-10:].min())
+                w0 = float(hi[-30:-10].max() - lo[-30:-10].min()) if len(cl) >= 30 else 0.0
+                o["coil"] = bool(w0 and w1 / w0 < 0.6)                                           # range compressing under resistance
+                o["recl50"] = bool(len(cl) >= 55 and cl[-1] > s50v and float(min(cl[-5:])) <= float(cl[-55:-5].mean()) * 1.02)
+                brk = 0
+                if o["hh"]: brk += 6
+                if o["stack"]: brk += 6
+                elif o["above20"]: brk += 3
+                if o["high20"] >= -3: brk += 8
+                elif o["high20"] >= -8: brk += 4
+                if o["coil"]: brk += 5
+                if o["recl50"]: brk += 4
+                if o["vr"] >= 2: brk += 8
+                elif o["vr"] >= 1.3: brk += 5
+                if 50 <= o["rsi"] <= 72: brk += 4
+                elif o["rsi"] > 78: brk -= 3
+                if o["pm_chg"] is not None and 1 <= o["pm_chg"] <= 12: brk += 3
+                bot = min(max(brk, 0) + gpts, 35)
+                setup = fuel + bot - (6 if o["up3d"] > 25 else 0)          # chasing something already vertical is how you buy the top
+                if o["up3d"] > 25: flags.append(f"already vertical (+{o['up3d']}% / 3d)")
+                if o["hh"]: flags.append("higher highs and lows")
+                if o["high20"] >= -3: flags.append("at 20-day high")
+                elif o["high20"] >= -8: flags.append(f"{abs(o['high20'])}% under 20-day high")
+                if o["coil"]: flags.append("coiling under resistance")
+                if o["recl50"]: flags.append("reclaimed 50-day")
+                if o["stack"]: flags.append("above 20 & 50-day")
             if o["vr"] >= 1.3: flags.append(f"volume pickup {o['vr']}x")
             if b.get("fee") is not None and b["fee"] >= 20: flags.append(f"borrow fee {b['fee']}%")
             if b.get("avail") is not None and b["avail"] < 100_000: flags.append(f"{b['avail']:,} shares to borrow")
@@ -598,7 +653,7 @@ def _clean(v):
 
 def assemble(side, mode, universe, pass1, top_in, deep_out, full_asof):
     keys = ("t","co","px","sf","sr","rsi","rsi3","lo","hi","low20","high20","up3d","vr","pq","pm","pw","p10","s20","av","mc","earn",
-            "runway","dil","ipo_days","gapfail","borrow","k8","shrg","flt","fltm","ins","si_date","si_chg","fee_chg","gam","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
+            "runway","dil","ipo_days","gapfail","borrow","k8","shrg","flt","fltm","ins","si_date","si_chg","fee_chg","gam","hh","stack","coil","recl50","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
             "fuel","bot","opt","setup","score","flags","play","dud","alts","closes","err")
     top = [{k: o.get(k) for k in keys} for o in deep_out[:16]]
     for o in top: o["lo52"] = o.pop("lo"); o["hi52"] = o.pop("hi")
@@ -608,7 +663,7 @@ def assemble(side, mode, universe, pass1, top_in, deep_out, full_asof):
                        stage1=top_in, top=top, rest=rest, cfg=CFG[side]))
 
 def run_side(side, mode, now_et):
-    data = DATA_ROOT if side == "calls" else DATA_ROOT / "puts"
+    data = DATA_ROOT if side == "calls" else DATA_ROOT / side
     data.mkdir(parents=True, exist_ok=True); (data / "history").mkdir(exist_ok=True)
     today = now_et.strftime("%Y-%m-%d"); prev = None
     if (data / "latest.json").exists():
@@ -620,7 +675,7 @@ def run_side(side, mode, now_et):
         mode = "full"
     log.info("== %s · %s", side, mode)
     if mode == "full":
-        universe, pass1, top = (stage1_calls if side == "calls" else stage1_puts)()
+        universe, pass1, top = (stage1_puts() if side == "puts" else stage1_calls(side))
         full_asof = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     else:
         universe, pass1, top, full_asof = prev["universe"], prev["pass1"], prev["stage1"], prev.get("full_asof")
@@ -641,7 +696,7 @@ def main():
         hhmm = now_et.hour * 100 + now_et.minute
         if now_et.weekday() >= 5 or not (825 <= hhmm <= 1610):
             log.info("auto: outside 08:25–16:10 ET weekday window — skipping"); return 0
-    for s in (["calls", "puts"] if side == "both" else [side]):
+    for s in (SIDES if side in ("both", "all") else [side]):
         try: run_side(s, mode, now_et)
         except Exception as e: log.error("%s side failed: %s", s, e)
     return 0
