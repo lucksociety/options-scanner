@@ -188,6 +188,58 @@ def hv_percentile(cl, n=20):
     if len(hv) < 30: return None
     return int(round((hv < hv[-1]).mean() * 100)), round(float(hv[-1]), 1)
 
+def log_metric(kind, t, value, days=30):
+    """Append today's value to data/<kind>/<T>.json and report the change vs the oldest sample in the window.
+    The LEVEL says how crowded a short is; the TREND says whether shorts are actually being forced."""
+    try:
+        if value is None: return None
+        d = DATA_ROOT / kind; d.mkdir(parents=True, exist_ok=True); f = d / f"{t}.json"
+        hist = json.load(open(f)) if f.exists() else {}
+        hist[datetime.now(ET).strftime("%Y-%m-%d")] = round(float(value), 3)
+        hist = dict(sorted(hist.items())[-260:]); json.dump(hist, open(f, "w"), separators=(",", ":"))
+        cutoff = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
+        win = [v for k, v in sorted(hist.items()) if k >= cutoff]
+        if len(win) < 2: return None
+        return round(float(value) - win[0], 2)
+    except Exception as e:
+        log.debug("log_metric %s %s: %s", kind, t, e); return None
+
+def float_pts(fl):
+    """Squeeze mechanics: the same short interest is far more dangerous against a small tradable float."""
+    if not fl: return 0, None
+    m = fl / 1e6
+    return (8 if m < 10 else 6 if m < 25 else 4 if m < 50 else 2 if m < 100 else 1 if m < 300 else 0), round(m, 1)
+
+def gamma_setup(chain, px, adv=None):
+    """Dealer-hedging fuel: calls stacked just above spot that market makers must hedge into if price gets there."""
+    try:
+        cs, ps = chain.calls, chain.puts
+        coi = float(cs["openInterest"].fillna(0).sum()); poi = float(ps["openInterest"].fillna(0).sum())
+        cvol = float(cs["volume"].fillna(0).sum()); pvol = float(ps["volume"].fillna(0).sum())
+        band = cs[(cs["strike"] >= px) & (cs["strike"] <= px * 1.20)]
+        ramp = float(band["openInterest"].fillna(0).sum()) * 100        # shares behind those calls
+        return dict(coi=int(coi), poi=int(poi), cp=round(coi / poi, 2) if poi else None,
+                    cvol=int(cvol), pvol=int(pvol), cpv=round(cvol / pvol, 2) if pvol else None,
+                    ramp=int(ramp), ramp_adv=round(ramp / adv, 2) if adv else None)
+    except Exception as e:
+        log.debug("gamma: %s", e); return None
+
+def gamma_pts(g):
+    """0-8, matching the weight the playbook gives options positioning."""
+    if not g: return 0, []
+    pts, fl = 0, []
+    ra = g.get("ramp_adv")
+    if ra is not None:
+        if ra >= 1.0: pts += 4; fl.append(f"call wall {ra}x daily volume")
+        elif ra >= 0.4: pts += 2; fl.append(f"call wall {ra}x daily volume")
+    cp = g.get("cp")
+    if cp is not None:
+        if cp >= 2.5: pts += 2; fl.append(f"calls {cp}x puts (OI)")
+        elif cp >= 1.3: pts += 1
+    cpv = g.get("cpv")
+    if cpv is not None and cpv >= 2.5: pts += 2; fl.append(f"call volume {cpv}x puts today")
+    return min(pts, 8), fl
+
 IV_DIR = DATA_ROOT / "iv"
 def iv_rank(t, iv_now):
     """Log today's ATM IV for this ticker and return its rank in our own history (needs >= 20 days), else None."""
@@ -239,6 +291,10 @@ def stage1_calls():
             info = yf.Ticker(r["t"]).info
             r["sf"] = round(float(info.get("shortPercentOfFloat") or 0) * 100, 2); r["sr"] = round(float(info.get("shortRatio") or 0), 2)
             r["earn"] = earn_label(info); r["earn_ts"] = info.get("earningsTimestampStart") or info.get("earningsTimestamp")
+            r["flt"] = info.get("floatShares"); r["shout"] = info.get("sharesOutstanding")
+            r["ins"] = round(float(info.get("heldPercentInsiders") or 0) * 100, 1)
+            sid = info.get("dateShortInterest")
+            r["si_date"] = datetime.fromtimestamp(sid, timezone.utc).strftime("%Y-%m-%d") if sid else None
         except Exception as e: log.warning("info %s: %s", r["t"], e)
         time.sleep(0.15)
     keep = [x for x in rows if x["av"] >= c["avgvol_min"] and x["sf"] >= c["si_min"]]
@@ -309,6 +365,10 @@ def stage1_puts():
             info = yf.Ticker(r["t"]).info
             r["sf"] = round(float(info.get("shortPercentOfFloat") or 0) * 100, 2); r["sr"] = round(float(info.get("shortRatio") or 0), 2)
             r["earn"] = earn_label(info); r["earn_ts"] = info.get("earningsTimestampStart") or info.get("earningsTimestamp")
+            r["flt"] = info.get("floatShares"); r["shout"] = info.get("sharesOutstanding")
+            r["ins"] = round(float(info.get("heldPercentInsiders") or 0) * 100, 1)
+            sid = info.get("dateShortInterest")
+            r["si_date"] = datetime.fromtimestamp(sid, timezone.utc).strftime("%Y-%m-%d") if sid else None
             cash = info.get("totalCash"); fcf = info.get("freeCashflow")
             if cash and fcf is not None and fcf < 0: r["runway"] = round(cash / (-fcf), 1)      # years of cash at current burn
             ft = info.get("firstTradeDateEpochUtc") or info.get("firstTradeDateMilliseconds")
@@ -346,14 +406,16 @@ def stage1_puts():
     return len(syms), len(keep), top
 
 # --------------------------------------------------------------------------- stage 2 · deep scan (both sides)
-def pick_contracts(tk, side, px, c, ivpen=0):
-    now = datetime.now(timezone.utc); lst = []; atm_iv = None
+def pick_contracts(tk, side, px, c, ivpen=0, adv=None):
+    now = datetime.now(timezone.utc); lst = []; atm_iv = None; gam = None
     exps = []
     for e in tk.options:
         dte = (datetime.strptime(e, "%Y-%m-%d").replace(tzinfo=timezone.utc) - now).days + 1
         if c["min_dte"] <= dte <= c["max_dte"]: exps.append((e, dte))
     for e, dte in exps[:3]:
-        chain = tk.option_chain(e); table = chain.calls if side == "calls" else chain.puts
+        chain = tk.option_chain(e)
+        if gam is None: gam = gamma_setup(chain, px, adv)      # nearest expiry carries the most gamma
+        table = chain.puts if side == "puts" else chain.calls
         if atm_iv is None and len(table):
             try:
                 near = table.iloc[(table["strike"] - px).abs().argsort()[:1]]
@@ -374,7 +436,7 @@ def pick_contracts(tk, side, px, c, ivpen=0):
                             vol=int(r.volume) if r.volume == r.volume else 0, iv=iv, be=round(be, 1), spread=round(spread * 100), q=round(q, 1)))
         time.sleep(0.25)
     lst.sort(key=lambda z: -z["q"])
-    return lst, atm_iv
+    return lst, atm_iv, gam
 
 def deep(x, side):
     c = CFG[side]; o = dict(x); o["err"] = ""
@@ -396,7 +458,8 @@ def deep(x, side):
         earn_ts = info.get("earningsTimestampStart") or info.get("earningsTimestamp") or x.get("earn_ts")
         if info.get("earningsTimestampStart"): o["earn"] = earn_label(info)
         # IV rank: our own log once it has 20+ days, else realized-vol percentile as a proxy
-        contracts, atm_iv = pick_contracts(tk, side, px, c)
+        contracts, atm_iv, gam = pick_contracts(tk, side, px, c, adv=x.get("av"))
+        o["gam"] = gam
         ivr = iv_rank(x["t"], atm_iv); o["ivr"] = ivr; o["ivr_src"] = "iv" if ivr is not None else "hv"
         if ivr is None: ivr = x.get("hvp")
         o["iv_rank"] = ivr; o["atm_iv"] = atm_iv
@@ -419,12 +482,18 @@ def deep(x, side):
         if side == "calls":
             o["rsiUp"] = o["rsi"] > o["rsi3"]; o["wasOversold"] = min(rs[-10:]) < 35
             o["low20"] = round(float(cl[-1] / cl[-20:].min() - 1) * 100, 1)
-            fuel = clamp(o["sf"] or 0, 0, 60) / 60 * 20 + clamp(o["sr"] or 0, 0, 10) / 10 * 7   # 0-27
+            fpts, fm = float_pts(x.get("flt")); o["fltm"] = fm
+            fuel = clamp(o["sf"] or 0, 0, 60) / 60 * 15 + fpts + clamp(o["sr"] or 0, 0, 10) / 10 * 6   # 0-29
             if b.get("fee") is not None:
-                fuel += 5 if b["fee"] >= 50 else (3 if b["fee"] >= 20 else (1 if b["fee"] >= 5 else 0))
-                fuel += 3 if b["avail"] < 100_000 else (1 if b["avail"] < 500_000 else 0)
+                fuel += 4 if b["fee"] >= 50 else (3 if b["fee"] >= 20 else (1 if b["fee"] >= 5 else 0))
+                fuel += 2 if b["avail"] < 100_000 else (1 if b["avail"] < 500_000 else 0)
             else:
-                fuel *= 35 / 27            # no borrow feed: rescale rather than leave 8 pts unreachable for everyone
+                fuel *= 35 / 29            # no borrow feed: rescale rather than strand 6 pts for everyone
+            # trend beats level: shorts piling in, or borrow getting expensive, is the actual tell
+            o["si_chg"] = log_metric("si", x["t"], o.get("sf"))
+            o["fee_chg"] = log_metric("fee", x["t"], b.get("fee"))
+            if (o["si_chg"] or 0) >= 2: fuel += 2
+            if (o["fee_chg"] or 0) >= 5: fuel += 2
             fuel = min(fuel, 35)
             bot = 0
             if 25 <= o["rsi"] <= 45: bot += 10
@@ -433,13 +502,17 @@ def deep(x, side):
             if o["wasOversold"]: bot += 5
             if o["low20"] <= 8 or (o["lo"] is not None and o["lo"] <= 15): bot += 5
             if o["vr"] >= 1.3: bot += 5
-            if o["pm_chg"] is not None and 2 <= o["pm_chg"] <= 15: bot = min(bot + 3, 35)
+            if o["pm_chg"] is not None and 2 <= o["pm_chg"] <= 15: bot += 3
+            gpts, gflags = gamma_pts(o.get("gam")); bot = min(bot + gpts, 35); flags += gflags
             setup = fuel + bot - (5 if o["up3d"] < -10 else 0)
             if o["up3d"] < -10: flags.append(f"still falling ({o['up3d']}% / 3d)")
             if o["rsiUp"]: flags.append("RSI turning up")
             if o["vr"] >= 1.3: flags.append(f"volume pickup {o['vr']}x")
             if b.get("fee") is not None and b["fee"] >= 20: flags.append(f"borrow fee {b['fee']}%")
             if b.get("avail") is not None and b["avail"] < 100_000: flags.append(f"{b['avail']:,} shares to borrow")
+            if o.get("fltm") is not None and o["fltm"] < 25: flags.append(f"{o['fltm']}M float")
+            if (o.get("si_chg") or 0) >= 2: flags.append(f"short interest +{o['si_chg']}pp")
+            if (o.get("fee_chg") or 0) >= 5: flags.append(f"borrow fee +{o['fee_chg']}pp")
             if (x.get("shrg") or 0) >= 15: setup -= 3; flags.append(f"shares +{x['shrg']}% in 6mo")   # they keep printing stock
             o.update(fuel=round(fuel, 1), bot=bot)
         else:
@@ -479,6 +552,10 @@ def deep(x, side):
             elif (x.get("shrg") or 0) >= 5: flags.append(f"shares +{x['shrg']}% in 6mo")
             if x.get("runway") is not None and x["runway"] < 1: flags.append(f"cash runway {x['runway']}y")
             if x.get("ipo_days") is not None and 150 <= x["ipo_days"] <= 200: flags.append("lockup window")
+            o["si_chg"] = log_metric("si", x["t"], o.get("sf")); o["fee_chg"] = log_metric("fee", x["t"], b.get("fee"))
+            gp = gamma_pts(o.get("gam"))[0]
+            if gp >= 4: press -= 3; flags.append("heavy call positioning against you")   # gamma cuts the other way on puts
+            o["fltm"] = float_pts(x.get("flt"))[1]
             o.update(fuel=round(press, 1), bot=top_)
         if o["pm_chg"] is not None and abs(o["pm_chg"]) >= 2: flags.append(f"pre-market {o['pm_chg']:+}%")
         if o.get("earn_in"): setup -= 8; flags.append(f"earnings inside window ({o.get('earn')})")
@@ -521,7 +598,7 @@ def _clean(v):
 
 def assemble(side, mode, universe, pass1, top_in, deep_out, full_asof):
     keys = ("t","co","px","sf","sr","rsi","rsi3","lo","hi","low20","high20","up3d","vr","pq","pm","pw","p10","s20","av","mc","earn",
-            "runway","dil","ipo_days","gapfail","borrow","k8","shrg","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
+            "runway","dil","ipo_days","gapfail","borrow","k8","shrg","flt","fltm","ins","si_date","si_chg","fee_chg","gam","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
             "fuel","bot","opt","setup","score","flags","play","dud","alts","closes","err")
     top = [{k: o.get(k) for k in keys} for o in deep_out[:16]]
     for o in top: o["lo52"] = o.pop("lo"); o["hi52"] = o.pop("hi")
