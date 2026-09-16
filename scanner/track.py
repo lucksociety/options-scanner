@@ -27,6 +27,8 @@ import yfinance as yf
 log = logging.getLogger("track"); logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 ROOT = Path(__file__).resolve().parent.parent; DATA = ROOT / "data"; OUT = DATA / "track"
 LOOKBACK_DAYS = 45
+SIDES = ("calls", "puts", "breakout")
+
 BUCKETS = [(0, 50, "<50"), (50, 60, "50-59"), (60, 70, "60-69"), (70, 101, "70+")]
 
 def bucket(sc):
@@ -35,7 +37,7 @@ def bucket(sc):
     return "<50"
 
 def load_history(side):
-    d = DATA / ("history" if side == "calls" else "puts/history")
+    d = DATA / ("history" if side == "calls" else f"{side}/history")
     cutoff = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
     out = []
     for f in sorted(d.glob("????-??-??.json")):
@@ -51,7 +53,7 @@ def entry_price(play):
 def option_mark(tk, play, side):
     """Current value of the contract: bid if there is one, else last. None if the chain can't be read."""
     try:
-        chain = tk.option_chain(play["exp"]); tab = chain.calls if side == "calls" else chain.puts
+        chain = tk.option_chain(play["exp"]); tab = chain.puts if side == "puts" else chain.calls
         row = tab[np.isclose(tab["strike"], play["strike"])]
         if row.empty: return None
         r = row.iloc[0]; bid = float(r.bid or 0); last = float(r.lastPrice or 0)
@@ -62,7 +64,7 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True); today = datetime.now(timezone.utc).date()
     summary = {"asof": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"), "sides": {}}
     open_all = []
-    for side in ("calls", "puts"):
+    for side in SIDES:
         hist = load_history(side)
         if not hist: continue
         (OUT / side).mkdir(exist_ok=True)
@@ -75,7 +77,7 @@ def main():
         log.info("%s: %d picks across %d days, %d tickers", side, len(picks), len(hist), len(syms))
         px = yf.download(syms, period="3mo", interval="1d", group_by="ticker", auto_adjust=False, threads=True, progress=False)
         tks = {}; per_day = {}
-        stats = {name: dict(n=0, hit=0, bust=0, open=0, stock_best=[], opt_ret=[]) for _, _, name in BUCKETS}
+        stats = {name: dict(n=0, hit=0, bust=0, open=0, stock_best=[], opt_ret=[], m10=0, m20=0, m50=0) for _, _, name in BUCKETS}
         for date, o in picks:
             t = o["t"]; play = o["play"]; entry = entry_price(play); px0 = float(o["px"]); be = float(play.get("be") or 0)
             k = float(play["strike"]); exp = datetime.strptime(play["exp"], "%Y-%m-%d").date()
@@ -86,7 +88,7 @@ def main():
             cl = h["Close"].to_numpy() if len(h) else np.array([]); hi = h["High"].to_numpy() if len(h) else cl; lo = h["Low"].to_numpy() if len(h) else cl
             ret = lambda n: round((float(cl[n - 1]) / px0 - 1) * 100, 1) if len(cl) >= n else None
             win = cl[:20]; win_hi = hi[:20]; win_lo = lo[:20]
-            if side == "calls":
+            if side != "puts":
                 best = round((float(win_hi.max()) / px0 - 1) * 100, 1) if len(win) else None
                 be_hit = bool(len(win) and float(win_hi.max()) >= k + entry)
                 intrinsic_exp = max(0.0, float(cl[-1]) - k) if (exp <= today and len(cl)) else None
@@ -110,7 +112,10 @@ def main():
             per_day.setdefault(date, []).append(rec)
             if dte_left >= -1 or status != "open": open_all.append(rec)
             b = stats[bucket(float(o.get("score") or 0))]; b["n"] += 1; b[status] += 1
-            if best is not None: b["stock_best"].append(best)
+            if best is not None:
+                b["stock_best"].append(best)
+                for m in (10, 20, 50):                      # measured frequency, not a modelled probability
+                    if best >= m: b[f"m{m}"] += 1
             if opt_ret is not None: b["opt_ret"].append(opt_ret)
         for date, recs in per_day.items():
             json.dump(recs, open(OUT / side / f"{date}.json", "w"), separators=(",", ":"))
@@ -120,6 +125,8 @@ def main():
             summ[name] = dict(n=b["n"], hit=b["hit"], bust=b["bust"], open=b["open"],
                               hit_rate=round(b["hit"] / decided * 100) if decided else None,
                               avg_best=round(float(np.mean(b["stock_best"])), 1) if b["stock_best"] else None,
+                              moved={str(m): dict(n=b[f"m{m}"], pct=round(b[f"m{m}"] / len(b["stock_best"]) * 100) if b["stock_best"] else None) for m in (10, 20, 50)},
+                              measured=len(b["stock_best"]),
                               med_opt=round(float(np.median(b["opt_ret"]))) if b["opt_ret"] else None)
         summary["sides"][side] = dict(days=len(hist), picks=len(picks), buckets=summ,
                                       first=hist[0][0], last=hist[-1][0])
@@ -131,4 +138,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
