@@ -22,26 +22,28 @@ log = logging.getLogger("alerts"); logging.basicConfig(level=logging.INFO, forma
 ROOT = Path(__file__).resolve().parent.parent; DATA = ROOT / "data"; SENT = DATA / "alerts" / "sent.json"
 ET = ZoneInfo("America/New_York")
 PAGE = "https://lucksociety.github.io/options-scanner/"
-THRESH = {"calls": 70, "puts": 60}
-COLOR = {"calls": 0x2FB35A, "puts": 0xE8604F}
+SIDES = ("calls", "puts", "breakout")
+THRESH = {"calls": 70, "puts": 60, "breakout": 70}
+COLOR = {"calls": 0x2FB35A, "puts": 0xE8604F, "breakout": 0x3B82F6}
+LABEL = {"calls": "Calls", "puts": "Puts", "breakout": "Breakout"}
 MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 
 def code(t, p, side):
     d = datetime.strptime(p["exp"], "%Y-%m-%d"); k = p["strike"]
-    return f"{t} {MON[d.month-1]} {d.day} ${k:g} {'C' if side == 'calls' else 'P'}"
+    return f"{t} {MON[d.month-1]} {d.day} ${k:g} {'P' if side == 'puts' else 'C'}"
 
 def embed(side, rank, o, why):
     p = o["play"]
     fields = [dict(name="Contract", value=f"**{code(o['t'], p, side)}**  {p['bid']:.2f} × {p['ask']:.2f} (last {p['last']:.2f})", inline=False),
-              dict(name="Score", value=f"**{round(o['score'])}** · {('fuel' if side=='calls' else 'pressure')} {round(o['fuel'])} · {('bottom' if side=='calls' else 'topping')} {round(o['bot'])} · contract {round(o['opt'])}", inline=True),
-              dict(name="Needs", value=f"{'+' if side=='calls' else '−'}{round(p['be'])}% to B/E · {p['dte']}d · OI {p['oi']:,}", inline=True)]
-    stats = (f"Short float {o.get('sf') or 0:.1f}% · DTC {o.get('sr') or 0:.1f} · RSI {round(o.get('rsi') or 0)}" if side == "calls"
+              dict(name="Score", value=f"**{round(o['score'])}** · {('pressure' if side=='puts' else 'fuel')} {round(o['fuel'])} · {({'calls':'bottom','puts':'topping'}.get(side,'breakout'))} {round(o['bot'])} · contract {round(o['opt'])}", inline=True),
+              dict(name="Needs", value=f"{'−' if side=='puts' else '+'}{round(p['be'])}% to B/E · {p['dte']}d · OI {p['oi']:,}", inline=True)]
+    stats = (f"Short float {o.get('sf') or 0:.1f}% · DTC {o.get('sr') or 0:.1f} · RSI {round(o.get('rsi') or 0)}" if side != "puts"
              else f"Run +{round(o.get('pw') or 0)}% / +{round(o.get('p10') or 0)}% · RSI {round(o.get('rsi') or 0)} · SI {o.get('sf') or 0:.1f}%")
     fields.append(dict(name="Stock", value=f"${o['px']:.2f} · {stats}", inline=False))
     if o.get("flags"): fields.append(dict(name="Flags", value=" · ".join(o["flags"][:6]), inline=False))
     return dict(title=f"#{rank} {o['t']} — {o['co']}"[:256], url=f"https://finviz.com/quote.ashx?t={o['t']}",
                 description=why, color=COLOR[side], fields=fields,
-                footer=dict(text=f"Luck Society Option Scanner · {'Calls' if side=='calls' else 'Puts'} · {datetime.now(ET).strftime('%b %d %I:%M %p ET')}"))
+                footer=dict(text=f"Luck Society Option Scanner · {LABEL[side]} · {datetime.now(ET).strftime('%b %d %I:%M %p ET')}"))
 
 def main():
     hook = os.environ.get("DISCORD_WEBHOOK", "").strip()
@@ -52,8 +54,8 @@ def main():
     except Exception: sent = {}
     if sent.get("date") != today: sent = {"date": today, "keys": []}
     keys = set(sent["keys"]); embeds = []
-    for side in ("calls", "puts"):
-        f = DATA / ("latest.json" if side == "calls" else "puts/latest.json")
+    for side in SIDES:
+        f = DATA / ("latest.json" if side == "calls" else f"{side}/latest.json")
         if not f.exists(): continue
         try: d = json.load(open(f))
         except Exception as e: log.warning("%s: %s", f, e); continue
@@ -78,4 +80,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
