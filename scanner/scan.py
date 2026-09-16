@@ -409,10 +409,12 @@ def deep(x, side):
         if side == "calls":
             o["rsiUp"] = o["rsi"] > o["rsi3"]; o["wasOversold"] = min(rs[-10:]) < 35
             o["low20"] = round(float(cl[-1] / cl[-20:].min() - 1) * 100, 1)
-            fuel = clamp(o["sf"] or 0, 0, 50) / 50 * 20 + clamp(o["sr"] or 0, 0, 10) / 10 * 7
+            fuel = clamp(o["sf"] or 0, 0, 60) / 60 * 20 + clamp(o["sr"] or 0, 0, 10) / 10 * 7   # 0-27
             if b.get("fee") is not None:
                 fuel += 5 if b["fee"] >= 50 else (3 if b["fee"] >= 20 else (1 if b["fee"] >= 5 else 0))
                 fuel += 3 if b["avail"] < 100_000 else (1 if b["avail"] < 500_000 else 0)
+            else:
+                fuel *= 35 / 27            # no borrow feed: rescale rather than leave 8 pts unreachable for everyone
             fuel = min(fuel, 35)
             bot = 0
             if 25 <= o["rsi"] <= 45: bot += 10
@@ -422,13 +424,13 @@ def deep(x, side):
             if o["low20"] <= 8 or (o["lo"] is not None and o["lo"] <= 15): bot += 5
             if o["vr"] >= 1.3: bot += 5
             if o["pm_chg"] is not None and 2 <= o["pm_chg"] <= 15: bot = min(bot + 3, 35)
-            s = fuel + bot + opt - (5 if o["up3d"] < -10 else 0)
+            setup = fuel + bot - (5 if o["up3d"] < -10 else 0)
             if o["up3d"] < -10: flags.append(f"still falling ({o['up3d']}% / 3d)")
             if o["rsiUp"]: flags.append("RSI turning up")
             if o["vr"] >= 1.3: flags.append(f"volume pickup {o['vr']}x")
             if b.get("fee") is not None and b["fee"] >= 20: flags.append(f"borrow fee {b['fee']}%")
             if b.get("avail") is not None and b["avail"] < 100_000: flags.append(f"{b['avail']:,} shares to borrow")
-            if (x.get("shrg") or 0) >= 15: s -= 3; flags.append(f"shares +{x['shrg']}% in 6mo")   # they keep printing stock
+            if (x.get("shrg") or 0) >= 15: setup -= 3; flags.append(f"shares +{x['shrg']}% in 6mo")   # they keep printing stock
             o.update(fuel=round(fuel, 1), bot=bot)
         else:
             o["rsiDown"] = o["rsi"] < o["rsi3"]
@@ -457,7 +459,7 @@ def deep(x, side):
             if x.get("gapfail"): top_ += 6                                                     # gap up that failed = trapped buyers
             if o["pm_chg"] is not None and o["pm_chg"] <= -2: top_ += 3
             top_ = min(top_, 35)
-            s = press + top_ + opt - (5 if o["up3d"] > 10 else 0)                                # still ripping = don't step in front
+            setup = press + top_ - (5 if o["up3d"] > 10 else 0)                                # still ripping = don't step in front
             if o["up3d"] > 10: flags.append(f"still ripping (+{o['up3d']}% / 3d)")
             if o["rsiDown"]: flags.append("RSI rolling over")
             if o["reversal"]: flags.append("reversal day")
@@ -469,14 +471,19 @@ def deep(x, side):
             if x.get("ipo_days") is not None and 150 <= x["ipo_days"] <= 200: flags.append("lockup window")
             o.update(fuel=round(press, 1), bot=top_)
         if o["pm_chg"] is not None and abs(o["pm_chg"]) >= 2: flags.append(f"pre-market {o['pm_chg']:+}%")
-        if o.get("earn_in"): s -= 8; flags.append(f"earnings inside window ({o.get('earn')})")
+        if o.get("earn_in"): setup -= 8; flags.append(f"earnings inside window ({o.get('earn')})")
         elif re.match(r"^[A-Z][a-z]{2} \d", o.get("earn") or ""):
             m = datetime.now(ET).month; mn = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
             if re.match(f"^({mn[m-1]}|{mn[m % 12]})", o["earn"]): flags.append(f"earnings {o['earn']}")
         if x.get("k8"): flags.append(f"8-K filed {x['k8'][5:]}")
         if ivr is not None and ivr >= 60: flags.append(f"IV rank {ivr} (rich)")
         if not o["play"]: flags.insert(0, f"no tradeable {'call' if side == 'calls' else 'put'} ≤ ${c['max_ask']:.2f}")
-        o.update(flags=flags, opt=round(opt, 1), score=round(s if o["play"] else min(s, 40), 1))
+        # Ranking = the stock setup only (fuel/pressure + bottoming/topping), rescaled 0-70 -> 0-100.
+        # Contract quality does NOT lift the score: it gates (no tradeable contract caps at 40 and sorts last)
+        # and breaks ties between equal setups. A great option can no longer carry a weak setup.
+        s = clamp(setup, 0, 70) / 70 * 100
+        o.update(flags=flags, setup=round(clamp(setup, 0, 70), 1), opt=round(opt, 1),
+                 score=round(s if o["play"] else min(s, 40), 1))
     except Exception as e:
         log.warning("%s: %s", x["t"], e); o["err"] = str(e)[:120]; o["score"] = -1
     return o
@@ -486,7 +493,7 @@ def stage2(top, side):
     for i, x in enumerate(top):
         out.append(deep(x, side)); time.sleep(0.4)
         if i % 10 == 9: log.info("deep %d/%d", i + 1, len(top))
-    out.sort(key=lambda o: (0 if o.get("play") else 1, -o["score"]))   # names with a real contract rank first
+    out.sort(key=lambda o: (0 if o.get("play") else 1, -o["score"], -(o.get("opt") or 0)))   # setup first; contract breaks ties
     return out
 
 def _clean(v):
@@ -501,7 +508,7 @@ def _clean(v):
 def assemble(side, mode, universe, pass1, top_in, deep_out, full_asof):
     keys = ("t","co","px","sf","sr","rsi","rsi3","lo","hi","low20","high20","up3d","vr","pq","pm","pw","p10","s20","av","mc","earn",
             "runway","dil","ipo_days","gapfail","borrow","k8","shrg","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
-            "fuel","bot","opt","score","flags","play","alts","closes","err")
+            "fuel","bot","opt","setup","score","flags","play","alts","closes","err")
     top = [{k: o.get(k) for k in keys} for o in deep_out[:16]]
     for o in top: o["lo52"] = o.pop("lo"); o["hi52"] = o.pop("hi")
     rest = [[o["t"], o.get("px"), o.get("sf"), o.get("rsi"), o.get("score"), 1 if o.get("play") else 0] for o in deep_out[16:]]
