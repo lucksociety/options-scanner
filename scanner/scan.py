@@ -27,6 +27,8 @@ import numpy as np
 import yfinance as yf
 from yfinance import EquityQuery as EQ
 
+from market import regime
+
 log = logging.getLogger("scan")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -37,6 +39,7 @@ SEC_UA = {"User-Agent": "LuckSocietyOptionScanner/1.0 (lucksociety@users.noreply
           "Accept-Encoding": "gzip, deflate", "Accept": "application/json, text/plain, */*"}
 
 SIDES = ("calls", "puts", "breakout")
+MKT = None          # market regime, scored once per run (scanner/market.py)
 
 CFG = {
     "calls": dict(price_min=1.0, price_max=10.0, si_min=15.0, avgvol_min=300_000, deep_n=40,
@@ -672,6 +675,10 @@ def deep(x, side):
         # Contract quality does NOT lift the score: it gates (no tradeable contract caps at 40 and sorts last)
         # and breaks ties between equal setups. A great option can no longer carry a weak setup.
         s = clamp(setup, 0, 70) / 70 * 100
+        # The tape gets 15% of the score: the same setup is worth less when shorts are being paid.
+        mk = (MKT or {}).get("score")
+        o["mkt"] = mk
+        if mk is not None: s = 0.85 * s + 0.15 * mk
         o.update(flags=flags, setup=round(clamp(setup, 0, 70), 1), opt=round(opt, 1),
                  score=round(s if o["play"] else min(s, 40), 1))
     except Exception as e:
@@ -697,13 +704,13 @@ def _clean(v):
 
 def assemble(side, mode, universe, pass1, top_in, deep_out, full_asof):
     keys = ("t","co","px","sf","sr","rsi","rsi3","lo","hi","low20","high20","up3d","vr","pq","pm","pw","p10","s20","av","mc","earn",
-            "runway","dil","ipo_days","gapfail","borrow","k8","shrg","flt","fltm","ins","si_date","si_chg","fee_chg","gam","inst","ss","ssp","ssp_date","si_rep","ftd","atr","dv","rv10","h20","h50","hh","stack","coil","recl50","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
+            "runway","dil","ipo_days","gapfail","borrow","k8","shrg","flt","fltm","ins","si_date","si_chg","fee_chg","gam","mkt","inst","ss","ssp","ssp_date","si_rep","ftd","atr","dv","rv10","h20","h50","hh","stack","coil","recl50","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
             "fuel","bot","opt","setup","score","flags","play","dud","alts","closes","err")
     top = [{k: o.get(k) for k in keys} for o in deep_out[:16]]
     for o in top: o["lo52"] = o.pop("lo"); o["hi52"] = o.pop("hi")
     rest = [[o["t"], o.get("px"), o.get("sf"), o.get("rsi"), o.get("score"), 1 if o.get("play") else 0] for o in deep_out[16:]]
     return _clean(dict(side=side, asof=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-                       full_asof=full_asof, mode=mode, universe=universe, pass1=pass1, deep=len(deep_out),
+                       full_asof=full_asof, mode=mode, universe=universe, pass1=pass1, deep=len(deep_out), market=MKT,
                        stage1=top_in, top=top, rest=rest, cfg=CFG[side]))
 
 def run_side(side, mode, now_et):
@@ -734,6 +741,13 @@ def main():
     mode = (sys.argv[1] if len(sys.argv) > 1 else "auto").lower()
     side = (sys.argv[2] if len(sys.argv) > 2 else "both").lower()
     now_et = datetime.now(ET)
+    global MKT
+    try:
+        MKT = regime()
+        DATA_ROOT.mkdir(parents=True, exist_ok=True)
+        json.dump(MKT, open(DATA_ROOT / "market.json", "w"), separators=(",", ":"))
+    except Exception as e:
+        log.error("market regime failed: %s", e); MKT = None
     if mode == "auto" and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
         mode = "full"
     if mode == "auto":
