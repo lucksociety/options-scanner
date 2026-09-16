@@ -37,14 +37,15 @@ jobs:
         run: python scanner/alerts.py
       - name: Publish results
         run: |
-          if [ -n "$(git status --porcelain data)" ]; then
-            git config user.name "luck-society-scanner-bot"
-            git config user.email "actions@users.noreply.github.com"
-            git add data
-            git commit -m "scan: $(date -u '+%F %H:%M') UTC"
-            git pull --rebase
-            git push
-          else
-            echo "no new results"
-          fi
-
+          if [ -z "$(git status --porcelain data)" ]; then echo "no new results"; exit 0; fi
+          git config user.name "luck-society-scanner-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data
+          git commit -m "scan: $(date -u '+%F %H:%M') UTC"
+          # data/ is generated output: on a conflict the fresher scan always wins ("theirs" = the commit being replayed)
+          for i in 1 2 3 4 5; do
+            if git pull --rebase -X theirs && git push; then echo "published on attempt $i"; exit 0; fi
+            git rebase --abort 2>/dev/null || true
+            sleep $((RANDOM % 10 + 5))
+          done
+          echo "could not publish after 5 attempts"; exit 1
