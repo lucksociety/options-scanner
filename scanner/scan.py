@@ -570,45 +570,55 @@ def pick_contracts(tk, side, px, c, ivpen=0, adv=None):
     lst.sort(key=lambda z: -z["q"])
     return lst, atm_iv, gam
 
+# Measured on 2y of daily history for today's shorted $1-10 universe (211 names, 9,267 pattern days; survivorship-biased,
+# entry = next day's open). Baseline for a random day on these names: 34% reach +20% within 20 sessions, 11% reach +50%.
+TRIG_STATS = {"strong":   dict(hit20=52.5, hit50=24.3, best=21.7, mae=-10.2, close=-6.7, n=1080),
+              "standard": dict(hit20=46.5, hit50=19.1, best=17.6, mae=-8.2,  close=-5.4, n=2372),
+              "armed":    dict(hit20=38.3, hit50=12.3, best=14.4, mae=-5.9,  close=-4.0, n=9267),
+              "baseline": dict(hit20=34.2, hit50=10.6, best=13.0, mae=-5.0,  close=-4.6, n=1513), "asof": "2026-09-17"}
+
 def trigger(o, cl, hi, lo, op, vol, av, band, last_is_today=True):
-    """Fuel says the gun is loaded; this says whether it is firing. Long-only 'short-covering pressure' entry:
-    a 10-day-high breakout, volume running ahead of normal for this point in the session, relative strength
-    against SPY, and a close in the top quarter of the day's range. In a red tape every bar is higher —
-    the strategy does not switch off in a bear market, it demands more confirmation. Also detects the
-    failed-breakdown reversal: fresh shorts pressed a new low, price snapped back through it on volume."""
+    """Fuel says the gun is loaded; this says whether it is firing. Calibrated on the backtest above, which
+    overturned three folklore rules: (1) volume is the signal — RVOL >= 3 or 3-day/20-day volume >= 2 lifts the
+    +20% hit-rate from 38% to 48%, while 1.5x barely moves it; (2) relative strength only helps once it is LARGE
+    (>= 20pp vs SPY over 5 days: 52%) — the +5pp/+8pp bars were noise, and 0-10pp was actually the WORST bucket;
+    (3) closing in the top of the range does nothing (38.1 / 38.4 / 38.3 across thirds). A 15%+ gap raises both
+    the hit-rate and the drawdown — flagged, not blocked. Bear vs bull bars were not supported either: fired
+    setups hit +20% 46% of the time in bear tapes and 45% in bull; the regime stays in the score, not the gate.
+    Every bucket has a NEGATIVE median close 20 sessions later: these are spike names. Sell into strength."""
     now = datetime.now(ET); t = {}
-    # volume vs what is normal for this time of day, so a 10:30am bar is not read as a dead session
     mins = (now.hour - 9) * 60 + now.minute - 30
     frac = clamp(mins / 390, 0.12, 1.0) if (last_is_today and now.weekday() < 5) else 1.0   # a finished bar is a full day
     rvol = float(vol[-1]) / (av * frac) if av else None; t["rvol"] = round(rvol, 2) if rvol is not None else None
+    t["vr20"] = round(float(vol[-3:].mean() / (vol[-23:-3].mean() or 1)), 2)
     bench = (MKT or {}).get("bench") or {}
     t["rs5_spy"] = round(float(cl[-1] / cl[-6] - 1) * 100 - (bench.get("spy5") or 0), 1) if len(cl) > 6 and bench.get("spy5") is not None else None
-    rng = float(hi[-1] - lo[-1]); clpos = float(cl[-1] - lo[-1]) / rng if rng > 0 else None
+    rng = float(hi[-1] - lo[-1]); t["clpos"] = round(float(cl[-1] - lo[-1]) / rng, 2) if rng > 0 else None
     t["brk10"] = bool(len(hi) > 11 and cl[-1] > float(hi[-11:-1].max()))            # closing above the prior 10-day high
     t["gap"] = round(float(op[-1] / cl[-2] - 1) * 100, 1) if len(cl) > 1 and op[-1] else None
-    ret5 = float(cl[-1] / cl[-6] - 1) * 100 if len(cl) > 6 else 0.0
-    # failed breakdown: within the last 5 sessions a new 20-day low was printed, and price is now back above
-    # that low AND above yesterday's high — the shorts who pressed the break are underwater at once.
     fb = False
     if len(cl) > 26:
         prior_low = float(lo[-26:-6].min()); recent_low_i = int(np.argmin(lo[-6:])); recent_low = float(lo[-6:][recent_low_i])
         fb = recent_low < prior_low and cl[-1] > prior_low and cl[-1] > hi[-2] and recent_low_i < 5
     t["failbd"] = bool(fb)
-    # thresholds by regime: green/amber = bull rules, red = bear rules
-    bear = band == "red"
-    need = dict(rvol=2.0 if bear else 1.5, rs=8.0 if bear else 5.0, clpos=0.75)
-    t["need"] = need
-    ok_vol = rvol is not None and rvol >= need["rvol"]
-    ok_rs = t["rs5_spy"] is not None and t["rs5_spy"] >= need["rs"]
-    ok_cl = clpos is not None and clpos >= need["clpos"]
-    ok_abs = (ret5 > 0) if bear else True
-    chasing = t["gap"] is not None and t["gap"] >= 15
-    fired = (t["brk10"] or fb) and ok_vol and ok_rs and ok_cl and ok_abs and not chasing
-    t["state"] = "chasing" if chasing and (t["brk10"] or fb) else ("fired" if fired else ("armed" if (t["brk10"] or fb) else "idle"))
+    pattern = t["brk10"] or fb
+    vol_strong = (rvol is not None and rvol >= 3.0) or t["vr20"] >= 2.0
+    vol_ok = (rvol is not None and rvol >= 2.0) or t["vr20"] >= 2.0
+    rs_big = t["rs5_spy"] is not None and t["rs5_spy"] >= 20
+    if pattern and vol_strong and rs_big: state, tier = "fired", "strong"
+    elif pattern and vol_ok: state, tier = "fired", "standard"
+    elif pattern: state, tier = "armed", "armed"
+    else: state, tier = "idle", None
+    t["state"], t["tier"] = state, tier
+    t["stats"] = TRIG_STATS.get(tier) if tier else None
     t["kind"] = "failed breakdown" if fb else ("10-day breakout" if t["brk10"] else None)
     t["entry"] = round(float(hi[-1]), 2); t["stop"] = round(float(lo[-1]), 2)           # signal-day high / low
-    t["why"] = [w for w, k in ((f"RVOL {t['rvol']}x (need {need['rvol']})", ok_vol), (f"RS vs SPY {t['rs5_spy']:+}pp (need +{need['rs']:g})" if t["rs5_spy"] is not None else "RS n/a", ok_rs),
-                               (f"close {round((clpos or 0)*100)}% up the range (need 75%)", ok_cl), ("5d return positive", ok_abs)) if not k]
+    t["extended"] = bool(t["gap"] is not None and t["gap"] >= 15)                          # spikier both ways, not excluded
+    t["why"] = []
+    if pattern and not vol_ok: t["why"].append(f"volume RVOL {t['rvol']}x / 3d-vs-20d {t['vr20']}x (need RVOL 2 or 3d 2x)")
+    if pattern and vol_ok and not (vol_strong and rs_big):
+        if not vol_strong: t["why"].append(f"RVOL {t['rvol']}x — 3x would make it strong")
+        if not rs_big: t["why"].append(f"RS vs SPY {t['rs5_spy']:+}pp — 20pp would make it strong" if t["rs5_spy"] is not None else "RS n/a")
     return t
 
 def deep(x, side):
@@ -813,9 +823,10 @@ def deep(x, side):
             try: last_today = h.index[-1].date() == datetime.now(ET).date()
             except Exception: last_today = True
             o["trig"] = trigger(o, cl, hi, lo, op, vol, x.get("av"), (MKT or {}).get("band"), last_today)
-            if o["trig"]["state"] == "fired": flags.insert(0, f"TRIGGERED — {o['trig']['kind']}")
-            elif o["trig"]["state"] == "chasing": flags.insert(0, f"gapped +{o['trig']['gap']}% — don't chase, wait for a VWAP hold")
-            elif o["trig"]["kind"]: flags.append(f"{o['trig']['kind']} without confirmation ({'; '.join(o['trig']['why'][:2])})")
+            tg = o["trig"]
+            if tg["state"] == "fired": flags.insert(0, f"TRIGGERED ({tg['tier']}) — {tg['kind']}")
+            elif tg["kind"]: flags.append(f"{tg['kind']} without volume ({'; '.join(tg['why'][:1])})")
+            if tg.get("extended"): flags.append(f"gapped +{tg['gap']}% — spikier both ways (median dip −11%)")
         # Ranking = the stock setup only (fuel/pressure + bottoming/topping), rescaled 0-70 -> 0-100.
         # Contract quality does NOT lift the score: it gates (no tradeable contract caps at 40 and sorts last)
         # and breaks ties between equal setups. A great option can no longer carry a weak setup.
@@ -824,12 +835,11 @@ def deep(x, side):
         mk = (MKT or {}).get("score")
         o["mkt"] = mk
         if mk is not None: s = 0.85 * s + 0.15 * mk
-        if o.get("trig") and o["trig"]["state"] == "fired":
-            bar = 80 if (MKT or {}).get("band") == "red" else 70
-            if s < bar:
-                o["trig"]["state"] = "armed"; o["trig"]["why"].append(f"score {round(s)} under the {bar} bar")
-                ti = next((i for i, f in enumerate(flags) if f.startswith("TRIGGERED")), None)
-                if ti is not None: flags[ti] = f"{o['trig']['kind']} confirmed, but score {round(s)} is under the {bar} bar for this tape"
+        if o.get("trig") and o["trig"]["state"] == "fired" and s < 60:
+            # the backtest did not test the setup score, so the bar is a sanity floor, not a calibrated cut
+            o["trig"]["state"] = "armed"; o["trig"]["why"].append(f"score {round(s)} under the 60 floor")
+            ti = next((i for i, f in enumerate(flags) if f.startswith("TRIGGERED")), None)
+            if ti is not None: flags[ti] = f"{o['trig']['kind']} on volume, but setup score {round(s)} is under the 60 floor"
         o.update(flags=flags, setup=round(clamp(setup, 0, 70), 1), opt=round(opt, 1),
                  score=round(s if o["play"] else min(s, 40), 1),
                  pot=round(o["fuel"] / 35 * 100), imm=round(o["bot"] / 35 * 100))   # how explosive vs. is it starting now
