@@ -77,7 +77,8 @@ def main():
         log.info("%s: %d picks across %d days, %d tickers", side, len(picks), len(hist), len(syms))
         px = yf.download(syms, period="3mo", interval="1d", group_by="ticker", auto_adjust=False, threads=True, progress=False)
         tks = {}; per_day = {}
-        stats = {name: dict(n=0, hit=0, bust=0, open=0, stock_best=[], opt_ret=[], m10=0, m20=0, m50=0) for _, _, name in BUCKETS}
+        stats = {name: dict(n=0, hit=0, bust=0, open=0, stock_best=[], opt_ret=[], m10=0, m20=0, m50=0,
+                            c_n=0, c_hit=0, c_bust=0, c_ret=[]) for _, _, name in BUCKETS}
         for date, o in picks:
             t = o["t"]; play = o["play"]; entry = entry_price(play); px0 = float(o["px"]); be = float(play.get("be") or 0)
             k = float(play["strike"]); exp = datetime.strptime(play["exp"], "%Y-%m-%d").date()
@@ -104,6 +105,19 @@ def main():
             else:
                 tk = tks.setdefault(t, yf.Ticker(t)); mark = option_mark(tk, play, side); time.sleep(0.3)
             opt_ret = round((mark / entry - 1) * 100, 0) if (mark is not None and entry > 0) else None
+            # the closer strike, same rules: worth 2x entry (or stock through its breakeven) = hit
+            p2 = o.get("play2"); r2 = None
+            if p2:
+                try:
+                    e2 = entry_price(p2); k2 = float(p2["strike"]); ex2 = datetime.strptime(p2["exp"], "%Y-%m-%d").date()
+                    if side != "puts": be2_hit = bool(len(win) and float(win_hi.max()) >= k2 + e2); intr2 = max(0.0, float(cl[-1]) - k2) if (ex2 <= today and len(cl)) else None
+                    else: be2_hit = bool(len(win) and float(win_lo.min()) <= k2 - e2); intr2 = max(0.0, k2 - float(cl[-1])) if (ex2 <= today and len(cl)) else None
+                    if ex2 < today: m2 = round(intr2, 2) if intr2 is not None else None
+                    else: tk = tks.setdefault(t, yf.Ticker(t)); m2 = option_mark(tk, p2, side); time.sleep(0.3)
+                    ret2 = round((m2 / e2 - 1) * 100, 0) if (m2 is not None and e2 > 0) else None
+                    st2 = "hit" if ((ret2 is not None and ret2 >= 100) or be2_hit) else ("bust" if (ex2 < today and (m2 or 0) <= 0.01) else "open")
+                    r2 = dict(entry=e2, strike=k2, exp=p2["exp"], be=p2.get("be"), mark=m2, opt_ret=ret2, status=st2)
+                except Exception as ex_: log.debug("play2 %s: %s", t, ex_)
             dte_left = (exp - today).days
             if (opt_ret is not None and opt_ret >= 100) or be_hit: status = "hit"
             elif expired and (mark or 0) <= 0.01: status = "bust"
@@ -111,7 +125,7 @@ def main():
             else: status = "open"
             rec = dict(t=t, side=side, scan=date, score=o.get("score"), px0=px0, entry=entry, exp=play["exp"], strike=k, be=be, mae=mae,
                        fired=((o.get("trig") or {}).get("state") == "fired"), earn_in=bool(o.get("earn_in")), regime=(o.get("mkt")),
-                       r5=ret(5), r10=ret(10), r20=ret(20), best=best, be_hit=be_hit, mark=mark, opt_ret=opt_ret,
+                       r5=ret(5), r10=ret(10), r20=ret(20), best=best, be_hit=be_hit, mark=mark, opt_ret=opt_ret, closer=r2,
                        sessions=int(min(len(cl), 20)), expired=expired, status=status)
             per_day.setdefault(date, []).append(rec)
             if dte_left >= -1 or status != "open": open_all.append(rec)
@@ -121,6 +135,9 @@ def main():
                 for m in (10, 20, 50):                      # measured frequency, not a modelled probability
                     if best >= m: b[f"m{m}"] += 1
             if opt_ret is not None: b["opt_ret"].append(opt_ret)
+            if r2:
+                b["c_n"] += 1; b["c_" + r2["status"]] = b.get("c_" + r2["status"], 0) + 1
+                if r2["opt_ret"] is not None: b["c_ret"].append(r2["opt_ret"])
         for date, recs in per_day.items():
             json.dump(recs, open(OUT / side / f"{date}.json", "w"), separators=(",", ":"))
         summ = {}
@@ -131,7 +148,10 @@ def main():
                               avg_best=round(float(np.mean(b["stock_best"])), 1) if b["stock_best"] else None,
                               moved={str(m): dict(n=b[f"m{m}"], pct=round(b[f"m{m}"] / len(b["stock_best"]) * 100) if b["stock_best"] else None) for m in (10, 20, 50)},
                               measured=len(b["stock_best"]),
-                              med_opt=round(float(np.median(b["opt_ret"]))) if b["opt_ret"] else None)
+                              med_opt=round(float(np.median(b["opt_ret"]))) if b["opt_ret"] else None,
+                              closer=dict(n=b["c_n"], hit=b["c_hit"], bust=b["c_bust"],
+                                          hit_rate=round(b["c_hit"] / (b["c_hit"] + b["c_bust"]) * 100) if (b["c_hit"] + b["c_bust"]) else None,
+                                          med_opt=round(float(np.median(b["c_ret"]))) if b["c_ret"] else None))
         summary["sides"][side] = dict(days=len(hist), picks=len(picks), buckets=summ,
                                       first=hist[0][0], last=hist[-1][0])
         log.info("%s summary: %s", side, {k: (v["n"], v["hit_rate"]) for k, v in summ.items()})
