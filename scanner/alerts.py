@@ -41,6 +41,8 @@ def embed(side, rank, o, why):
              else f"Run +{round(o.get('pw') or 0)}% / +{round(o.get('p10') or 0)}% · RSI {round(o.get('rsi') or 0)} · SI {o.get('sf') or 0:.1f}%")
     fields.append(dict(name="Stock", value=f"${o['px']:.2f} · {stats}", inline=False))
     if o.get("flags"): fields.append(dict(name="Flags", value=" · ".join(o["flags"][:6]), inline=False))
+    tr = o.get("trig") or {}
+    if tr.get("state") == "fired": fields.append(dict(name="Trigger", value=f"{tr.get('kind')} · RVOL {tr.get('rvol')}× · RS vs SPY {tr.get('rs5_spy'):+}pp · signal-day high ${tr.get('entry')} / low ${tr.get('stop')}", inline=False))
     return dict(title=f"#{rank} {o['t']} — {o['co']}"[:256], url=f"https://finviz.com/quote.ashx?t={o['t']}",
                 description=why, color=COLOR[side], fields=fields,
                 footer=dict(text=f"Luck Society Option Scanner · {LABEL[side]} · {datetime.now(ET).strftime('%b %d %I:%M %p ET')}"))
@@ -65,8 +67,11 @@ def main():
             if o["score"] >= THRESH[side]: why.append(f"Score {round(o['score'])} ≥ {THRESH[side]}")
             if i <= 3: why.append(f"Top {i} on the {side} board")
             if side == "puts" and o["score"] >= 50 and any("reversal" in fl for fl in o.get("flags", [])): why.append("Reversal day")
+            tr = o.get("trig") or {}
+            fired = tr.get("state") == "fired"
+            if fired: why.insert(0, f"TRIGGERED: {tr.get('kind')} · entry above ${tr.get('entry')} · invalidation below ${tr.get('stop')}")
             if not why: continue
-            k = f"{side}:{o['t']}:{'hi' if o['score'] >= THRESH[side] else 'top3'}"
+            k = f"{side}:{o['t']}:{'fire' if fired else ('hi' if o['score'] >= THRESH[side] else 'top3')}"
             if k in keys: continue
             keys.add(k); embeds.append(embed(side, i, o, " · ".join(why)))
     if not embeds: log.info("nothing new to alert"); return 0
