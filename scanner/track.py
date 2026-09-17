@@ -88,8 +88,11 @@ def main():
             cl = h["Close"].to_numpy() if len(h) else np.array([]); hi = h["High"].to_numpy() if len(h) else cl; lo = h["Low"].to_numpy() if len(h) else cl
             ret = lambda n: round((float(cl[n - 1]) / px0 - 1) * 100, 1) if len(cl) >= n else None
             win = cl[:20]; win_hi = hi[:20]; win_lo = lo[:20]
+            mae = None
             if side != "puts":
                 best = round((float(win_hi.max()) / px0 - 1) * 100, 1) if len(win) else None
+                if len(win):
+                    ib = int(np.argmax(win_hi)); mae = round((float(win_lo[:ib + 1].min()) / px0 - 1) * 100, 1)   # worst dip BEFORE the best print
                 be_hit = bool(len(win) and float(win_hi.max()) >= k + entry)
                 intrinsic_exp = max(0.0, float(cl[-1]) - k) if (exp <= today and len(cl)) else None
             else:
@@ -106,7 +109,8 @@ def main():
             elif expired and (mark or 0) <= 0.01: status = "bust"
             elif opt_ret is not None and opt_ret <= -70 and dte_left < 5: status = "bust"
             else: status = "open"
-            rec = dict(t=t, side=side, scan=date, score=o.get("score"), px0=px0, entry=entry, exp=play["exp"], strike=k, be=be,
+            rec = dict(t=t, side=side, scan=date, score=o.get("score"), px0=px0, entry=entry, exp=play["exp"], strike=k, be=be, mae=mae,
+                       fired=((o.get("trig") or {}).get("state") == "fired"), earn_in=bool(o.get("earn_in")), regime=(o.get("mkt")),
                        r5=ret(5), r10=ret(10), r20=ret(20), best=best, be_hit=be_hit, mark=mark, opt_ret=opt_ret,
                        sessions=int(min(len(cl), 20)), expired=expired, status=status)
             per_day.setdefault(date, []).append(rec)
