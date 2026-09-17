@@ -1,19 +1,23 @@
 name: Luck Society Option Scanner
 
+# GitHub only honours a small fraction of high-frequency cron triggers on a free repo (we saw two scheduled
+# runs in a whole trading day against 100+ requested). So one run now LOOPS: it scans, publishes, sleeps
+# five minutes and scans again until the close. The schedule only has to land once or twice a day to keep
+# the board live, and the dashboard's "Scan now" button starts the same loop by hand.
 on:
   schedule:
-    - cron: "*/5 12-21 * * 1-5"   # every 5 min, weekdays; script only works 08:25–16:10 ET
+    - cron: "*/20 12-21 * * 1-5"   # weekdays; a run that starts outside 08:25–16:10 ET exits at once
   workflow_dispatch:
     inputs:
       mode:
-        description: "full = new screen + deep scan · refresh = re-quote current names"
+        description: "full = new screen + deep scan, then keep refreshing until the close · refresh = re-quote current names once"
         type: choice
         default: full
         options: [full, refresh]
 
 concurrency:
   group: scan
-  cancel-in-progress: false
+  cancel-in-progress: false      # a second trigger waits for the running loop, then takes over
 
 permissions:
   contents: write
@@ -21,7 +25,7 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 355         # GitHub's hard cap is 6 h; two loops cover the 08:25–16:10 ET session
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -29,23 +33,33 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Run scanner
-        run: python scanner/scan.py "${{ inputs.mode || 'auto' }}" both
-      - name: Discord alerts
+      - name: Scan, publish, repeat until the close
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: python scanner/alerts.py
-      - name: Publish results
+          MODE: ${{ inputs.mode || 'auto' }}
         run: |
-          if [ -z "$(git status --porcelain data)" ]; then echo "no new results"; exit 0; fi
           git config user.name "luck-society-scanner-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add data
-          git commit -m "scan: $(date -u '+%F %H:%M') UTC"
-          # data/ is generated output: on a conflict the fresher scan always wins ("theirs" = the commit being replayed)
-          for i in 1 2 3 4 5; do
-            if git pull --rebase -X theirs && git push; then echo "published on attempt $i"; exit 0; fi
-            git rebase --abort 2>/dev/null || true
-            sleep $((RANDOM % 10 + 5))
+          publish() {
+            if [ -z "$(git status --porcelain data)" ]; then echo "no new results"; return 0; fi
+            git add data
+            git commit -q -m "scan: $(date -u '+%F %H:%M') UTC"
+            # data/ is generated output: on a conflict the fresher scan always wins ("theirs" = the commit being replayed)
+            for i in 1 2 3 4 5; do
+              if git pull -q --rebase -X theirs && git push -q; then echo "published on attempt $i"; return 0; fi
+              git rebase --abort 2>/dev/null || true
+              sleep $((RANDOM % 10 + 5))
+            done
+            echo "could not publish after 5 attempts"; return 1
+          }
+          mode="$MODE"
+          for cycle in $(seq 1 70); do
+            echo "== cycle $cycle · mode $mode · $(date -u '+%H:%M') UTC"
+            rc=0; python scanner/scan.py "$mode" both || rc=$?      # bash -e would otherwise kill the loop on exit 3
+            if [ "$rc" = "3" ]; then echo "outside the trading window — done"; break; fi
+            python scanner/alerts.py || true
+            publish || true
+            if [ "$MODE" = "refresh" ]; then break; fi     # a one-shot refresh was asked for
+            mode=auto                                      # after the first pass, auto = refresh until 16:10 ET
+            sleep 300
           done
-          echo "could not publish after 5 attempts"; exit 1
