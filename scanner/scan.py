@@ -9,7 +9,8 @@ Luck Society Option Scanner — three boards, one engine.
             lockup expiry) that look like they're topping → best OTM put ≤ $0.35, 3–6 weeks out.
 
 Usage:  python scanner/scan.py <mode> [side]
-  mode   full | refresh | auto              (auto: full first run after 08:25 ET, refresh until 16:10 ET, else skip)
+  mode   full | refresh | auto | daily      (daily: one full scan per trading day, exit 3 if today's exists;
+                                             auto: full first run after 08:25 ET, refresh until 16:10 ET, else skip)
   side   calls | puts | breakout | both     (default both = all three)
 
 Data: Yahoo Finance via yfinance (screener, batched history, key stats, option chains) + SEC EDGAR (filings)
@@ -569,7 +570,7 @@ def pick_contracts(tk, side, px, c, ivpen=0, adv=None):
     lst.sort(key=lambda z: -z["q"])
     return lst, atm_iv, gam
 
-def trigger(o, cl, hi, lo, op, vol, av, band):
+def trigger(o, cl, hi, lo, op, vol, av, band, last_is_today=True):
     """Fuel says the gun is loaded; this says whether it is firing. Long-only 'short-covering pressure' entry:
     a 10-day-high breakout, volume running ahead of normal for this point in the session, relative strength
     against SPY, and a close in the top quarter of the day's range. In a red tape every bar is higher —
@@ -577,7 +578,8 @@ def trigger(o, cl, hi, lo, op, vol, av, band):
     failed-breakdown reversal: fresh shorts pressed a new low, price snapped back through it on volume."""
     now = datetime.now(ET); t = {}
     # volume vs what is normal for this time of day, so a 10:30am bar is not read as a dead session
-    mins = (now.hour - 9) * 60 + now.minute - 30; frac = clamp(mins / 390, 0.12, 1.0) if now.weekday() < 5 else 1.0
+    mins = (now.hour - 9) * 60 + now.minute - 30
+    frac = clamp(mins / 390, 0.12, 1.0) if (last_is_today and now.weekday() < 5) else 1.0   # a finished bar is a full day
     rvol = float(vol[-1]) / (av * frac) if av else None; t["rvol"] = round(rvol, 2) if rvol is not None else None
     bench = (MKT or {}).get("bench") or {}
     t["rs5_spy"] = round(float(cl[-1] / cl[-6] - 1) * 100 - (bench.get("spy5") or 0), 1) if len(cl) > 6 and bench.get("spy5") is not None else None
@@ -808,7 +810,9 @@ def deep(x, side):
                              f"{d0['spread']}% spread, needs {round(d0['be'])}%)") if d0
                             else f"no tradeable {kind_} ≤ ${c['max_ask']:.2f}")
         if side in ("calls", "breakout"):
-            o["trig"] = trigger(o, cl, hi, lo, op, vol, x.get("av"), (MKT or {}).get("band"))
+            try: last_today = h.index[-1].date() == datetime.now(ET).date()
+            except Exception: last_today = True
+            o["trig"] = trigger(o, cl, hi, lo, op, vol, x.get("av"), (MKT or {}).get("band"), last_today)
             if o["trig"]["state"] == "fired": flags.insert(0, f"TRIGGERED — {o['trig']['kind']}")
             elif o["trig"]["state"] == "chasing": flags.insert(0, f"gapped +{o['trig']['gap']}% — don't chase, wait for a VWAP hold")
             elif o["trig"]["kind"]: flags.append(f"{o['trig']['kind']} without confirmation ({'; '.join(o['trig']['why'][:2])})")
@@ -896,6 +900,14 @@ def main():
         json.dump(MKT, open(DATA_ROOT / "market.json", "w"), separators=(",", ":"))
     except Exception as e:
         log.error("market regime failed: %s", e); MKT = None
+    if mode == "daily":
+        # one full scan per trading day: if today's already exists, exit 3 so a fallback trigger does nothing
+        if now_et.weekday() >= 5: log.info("daily: weekend — skipping"); return 3
+        try: prev = json.load(open(DATA_ROOT / "latest.json"))
+        except Exception: prev = None
+        if prev and (prev.get("full_asof") or "")[:10] == now_et.strftime("%Y-%m-%d"):
+            log.info("daily: today's full scan already published — skipping"); return 3
+        mode = "full"
     if mode == "auto":
         hhmm = now_et.hour * 100 + now_et.minute
         if now_et.weekday() >= 5 or not (825 <= hhmm <= 1610):
