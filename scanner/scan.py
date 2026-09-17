@@ -790,12 +790,10 @@ def main():
         json.dump(MKT, open(DATA_ROOT / "market.json", "w"), separators=(",", ":"))
     except Exception as e:
         log.error("market regime failed: %s", e); MKT = None
-    if mode == "auto" and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
-        mode = "full"
     if mode == "auto":
         hhmm = now_et.hour * 100 + now_et.minute
         if now_et.weekday() >= 5 or not (825 <= hhmm <= 1610):
-            log.info("auto: outside 08:25–16:10 ET weekday window — skipping"); return 0
+            log.info("auto: outside 08:25–16:10 ET weekday window — skipping"); return 3   # 3 = the workflow loop stops here
     for s in (SIDES if side in ("both", "all") else [side]):
         try: run_side(s, mode, now_et)
         except Exception as e: log.error("%s side failed: %s", s, e)
