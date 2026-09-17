@@ -1,23 +1,24 @@
 name: Luck Society Option Scanner
 
-# GitHub only honours a small fraction of high-frequency cron triggers on a free repo (we saw two scheduled
-# runs in a whole trading day against 100+ requested). So one run now LOOPS: it scans, publishes, sleeps
-# five minutes and scans again until the close. The schedule only has to land once or twice a day to keep
-# the board live, and the dashboard's "Scan now" button starts the same loop by hand.
+# One full scan per trading day, before the open. 8:35 am ET is the sweet spot: yesterday's bar is complete
+# (so "closed in the top of its range" means the real close), IBKR borrow data has rolled overnight, Yahoo's
+# pre-market quote is live, and the board is ready before 9:30. GitHub honours only some cron triggers on a
+# free repo, so a second trigger at 9:05 is a fallback — the script exits at once if today's scan exists.
 on:
   schedule:
-    - cron: "*/20 12-21 * * 1-5"   # weekdays; a run that starts outside 08:25–16:10 ET exits at once
+    - cron: "35 12 * * 1-5"   # 8:35 am ET during EDT (7:35 am in winter — still pre-market)
+    - cron: "5 13 * * 1-5"    # 9:05 am ET fallback; no-op if the 8:35 run published
   workflow_dispatch:
     inputs:
       mode:
-        description: "full = new screen + deep scan, then keep refreshing until the close · refresh = re-quote current names once"
+        description: "full = new screen + deep scan · refresh = re-quote current names"
         type: choice
         default: full
         options: [full, refresh]
 
 concurrency:
   group: scan
-  cancel-in-progress: false      # a second trigger waits for the running loop, then takes over
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -25,7 +26,7 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 355         # GitHub's hard cap is 6 h; two loops cover the 08:25–16:10 ET session
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -33,33 +34,24 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Scan, publish, repeat until the close
+      - name: Scan
         env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          MODE: ${{ inputs.mode || 'auto' }}
+          MODE: ${{ inputs.mode || 'daily' }}
         run: |
+          rc=0; python scanner/scan.py "$MODE" both || rc=$?
+          if [ "$rc" = "3" ]; then echo "nothing to do"; exit 0; fi
+          exit $rc
+      - name: Publish results
+        run: |
+          if [ -z "$(git status --porcelain data)" ]; then echo "no new results"; exit 0; fi
           git config user.name "luck-society-scanner-bot"
           git config user.email "actions@users.noreply.github.com"
-          publish() {
-            if [ -z "$(git status --porcelain data)" ]; then echo "no new results"; return 0; fi
-            git add data
-            git commit -q -m "scan: $(date -u '+%F %H:%M') UTC"
-            # data/ is generated output: on a conflict the fresher scan always wins ("theirs" = the commit being replayed)
-            for i in 1 2 3 4 5; do
-              if git pull -q --rebase -X theirs && git push -q; then echo "published on attempt $i"; return 0; fi
-              git rebase --abort 2>/dev/null || true
-              sleep $((RANDOM % 10 + 5))
-            done
-            echo "could not publish after 5 attempts"; return 1
-          }
-          mode="$MODE"
-          for cycle in $(seq 1 70); do
-            echo "== cycle $cycle · mode $mode · $(date -u '+%H:%M') UTC"
-            rc=0; python scanner/scan.py "$mode" both || rc=$?      # bash -e would otherwise kill the loop on exit 3
-            if [ "$rc" = "3" ]; then echo "outside the trading window — done"; break; fi
-            python scanner/alerts.py || true
-            publish || true
-            if [ "$MODE" = "refresh" ]; then break; fi     # a one-shot refresh was asked for
-            mode=auto                                      # after the first pass, auto = refresh until 16:10 ET
-            sleep 300
+          git add data
+          git commit -q -m "scan: $(date -u '+%F %H:%M') UTC"
+          # data/ is generated output: on a conflict the fresher scan always wins ("theirs" = the commit being replayed)
+          for i in 1 2 3 4 5; do
+            if git pull -q --rebase -X theirs && git push -q; then echo "published on attempt $i"; exit 0; fi
+            git rebase --abort 2>/dev/null || true
+            sleep $((RANDOM % 10 + 5))
           done
+          echo "could not publish after 5 attempts"; exit 1
