@@ -569,13 +569,53 @@ def pick_contracts(tk, side, px, c, ivpen=0, adv=None):
     lst.sort(key=lambda z: -z["q"])
     return lst, atm_iv, gam
 
+def trigger(o, cl, hi, lo, op, vol, av, band):
+    """Fuel says the gun is loaded; this says whether it is firing. Long-only 'short-covering pressure' entry:
+    a 10-day-high breakout, volume running ahead of normal for this point in the session, relative strength
+    against SPY, and a close in the top quarter of the day's range. In a red tape every bar is higher —
+    the strategy does not switch off in a bear market, it demands more confirmation. Also detects the
+    failed-breakdown reversal: fresh shorts pressed a new low, price snapped back through it on volume."""
+    now = datetime.now(ET); t = {}
+    # volume vs what is normal for this time of day, so a 10:30am bar is not read as a dead session
+    mins = (now.hour - 9) * 60 + now.minute - 30; frac = clamp(mins / 390, 0.12, 1.0) if now.weekday() < 5 else 1.0
+    rvol = float(vol[-1]) / (av * frac) if av else None; t["rvol"] = round(rvol, 2) if rvol is not None else None
+    bench = (MKT or {}).get("bench") or {}
+    t["rs5_spy"] = round(float(cl[-1] / cl[-6] - 1) * 100 - (bench.get("spy5") or 0), 1) if len(cl) > 6 and bench.get("spy5") is not None else None
+    rng = float(hi[-1] - lo[-1]); clpos = float(cl[-1] - lo[-1]) / rng if rng > 0 else None
+    t["brk10"] = bool(len(hi) > 11 and cl[-1] > float(hi[-11:-1].max()))            # closing above the prior 10-day high
+    t["gap"] = round(float(op[-1] / cl[-2] - 1) * 100, 1) if len(cl) > 1 and op[-1] else None
+    ret5 = float(cl[-1] / cl[-6] - 1) * 100 if len(cl) > 6 else 0.0
+    # failed breakdown: within the last 5 sessions a new 20-day low was printed, and price is now back above
+    # that low AND above yesterday's high — the shorts who pressed the break are underwater at once.
+    fb = False
+    if len(cl) > 26:
+        prior_low = float(lo[-26:-6].min()); recent_low_i = int(np.argmin(lo[-6:])); recent_low = float(lo[-6:][recent_low_i])
+        fb = recent_low < prior_low and cl[-1] > prior_low and cl[-1] > hi[-2] and recent_low_i < 5
+    t["failbd"] = bool(fb)
+    # thresholds by regime: green/amber = bull rules, red = bear rules
+    bear = band == "red"
+    need = dict(rvol=2.0 if bear else 1.5, rs=8.0 if bear else 5.0, clpos=0.75)
+    t["need"] = need
+    ok_vol = rvol is not None and rvol >= need["rvol"]
+    ok_rs = t["rs5_spy"] is not None and t["rs5_spy"] >= need["rs"]
+    ok_cl = clpos is not None and clpos >= need["clpos"]
+    ok_abs = (ret5 > 0) if bear else True
+    chasing = t["gap"] is not None and t["gap"] >= 15
+    fired = (t["brk10"] or fb) and ok_vol and ok_rs and ok_cl and ok_abs and not chasing
+    t["state"] = "chasing" if chasing and (t["brk10"] or fb) else ("fired" if fired else ("armed" if (t["brk10"] or fb) else "idle"))
+    t["kind"] = "failed breakdown" if fb else ("10-day breakout" if t["brk10"] else None)
+    t["entry"] = round(float(hi[-1]), 2); t["stop"] = round(float(lo[-1]), 2)           # signal-day high / low
+    t["why"] = [w for w, k in ((f"RVOL {t['rvol']}x (need {need['rvol']})", ok_vol), (f"RS vs SPY {t['rs5_spy']:+}pp (need +{need['rs']:g})" if t["rs5_spy"] is not None else "RS n/a", ok_rs),
+                               (f"close {round((clpos or 0)*100)}% up the range (need 75%)", ok_cl), ("5d return positive", ok_abs)) if not k]
+    return t
+
 def deep(x, side):
     c = CFG[side]; o = dict(x); o["err"] = ""
     try:
         tk = yf.Ticker(x["t"])
         h = tk.history(period="3mo", interval="1d", auto_adjust=False).dropna(subset=["Close"])
         if len(h) < 25: raise RuntimeError("not enough price history")
-        cl = h["Close"].to_numpy(); hi = h["High"].to_numpy(); lo = h["Low"].to_numpy(); vol = h["Volume"].to_numpy()
+        cl = h["Close"].to_numpy(); hi = h["High"].to_numpy(); lo = h["Low"].to_numpy(); vol = h["Volume"].to_numpy(); op = h["Open"].to_numpy()
         px = round(float(cl[-1]), 2); o["px"] = px
         rs = rsi_series(cl)
         o["rsi"] = round(rs[-1], 1); o["rsi3"] = round(rs[-4], 1)
@@ -767,6 +807,11 @@ def deep(x, side):
             flags.insert(0, (f"only a junk {kind_} (bid {d0['bid']:.2f}, "
                              f"{d0['spread']}% spread, needs {round(d0['be'])}%)") if d0
                             else f"no tradeable {kind_} ≤ ${c['max_ask']:.2f}")
+        if side in ("calls", "breakout"):
+            o["trig"] = trigger(o, cl, hi, lo, op, vol, x.get("av"), (MKT or {}).get("band"))
+            if o["trig"]["state"] == "fired": flags.insert(0, f"TRIGGERED — {o['trig']['kind']}")
+            elif o["trig"]["state"] == "chasing": flags.insert(0, f"gapped +{o['trig']['gap']}% — don't chase, wait for a VWAP hold")
+            elif o["trig"]["kind"]: flags.append(f"{o['trig']['kind']} without confirmation ({'; '.join(o['trig']['why'][:2])})")
         # Ranking = the stock setup only (fuel/pressure + bottoming/topping), rescaled 0-70 -> 0-100.
         # Contract quality does NOT lift the score: it gates (no tradeable contract caps at 40 and sorts last)
         # and breaks ties between equal setups. A great option can no longer carry a weak setup.
@@ -775,6 +820,12 @@ def deep(x, side):
         mk = (MKT or {}).get("score")
         o["mkt"] = mk
         if mk is not None: s = 0.85 * s + 0.15 * mk
+        if o.get("trig") and o["trig"]["state"] == "fired":
+            bar = 80 if (MKT or {}).get("band") == "red" else 70
+            if s < bar:
+                o["trig"]["state"] = "armed"; o["trig"]["why"].append(f"score {round(s)} under the {bar} bar")
+                ti = next((i for i, f in enumerate(flags) if f.startswith("TRIGGERED")), None)
+                if ti is not None: flags[ti] = f"{o['trig']['kind']} confirmed, but score {round(s)} is under the {bar} bar for this tape"
         o.update(flags=flags, setup=round(clamp(setup, 0, 70), 1), opt=round(opt, 1),
                  score=round(s if o["play"] else min(s, 40), 1),
                  pot=round(o["fuel"] / 35 * 100), imm=round(o["bot"] / 35 * 100))   # how explosive vs. is it starting now
@@ -787,7 +838,7 @@ def stage2(top, side):
     for i, x in enumerate(top):
         out.append(deep(x, side)); time.sleep(0.4)
         if i % 10 == 9: log.info("deep %d/%d", i + 1, len(top))
-    out.sort(key=lambda o: (0 if o.get("play") else 1, -o["score"], -(o.get("opt") or 0)))   # setup first; contract breaks ties
+    out.sort(key=lambda o: (0 if o.get("play") else 1, 0 if (o.get("trig") or {}).get("state") == "fired" else 1, -o["score"], -(o.get("opt") or 0)))   # firing first, then setup; contract breaks ties
     return out
 
 def _clean(v):
@@ -801,7 +852,7 @@ def _clean(v):
 
 def assemble(side, mode, universe, pass1, top_in, deep_out, full_asof):
     keys = ("t","co","px","sf","sr","rsi","rsi3","lo","hi","low20","high20","up3d","vr","pq","pm","pw","p10","s20","av","mc","earn",
-            "runway","dil","ipo_days","gapfail","borrow","k8","shrg","flt","fltm","ins","si_date","si_chg","fee_chg","avail_chg","gam","mkt","exch","sf_src","att","att_z","att_mu","rs5","rs10","clpos","sma20_up","pot","imm","inst","ss","ssp","ssp_date","si_rep","ftd","atr","dv","rv10","h20","h50","hh","stack","coil","recl50","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
+            "runway","dil","ipo_days","gapfail","borrow","k8","shrg","flt","fltm","ins","si_date","si_chg","fee_chg","avail_chg","gam","mkt","exch","sf_src","att","att_z","att_mu","rs5","rs10","clpos","sma20_up","pot","imm","trig","inst","ss","ssp","ssp_date","si_rep","ftd","atr","dv","rv10","h20","h50","hh","stack","coil","recl50","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
             "fuel","bot","opt","setup","score","flags","play","dud","alts","closes","err")
     top = [{k: o.get(k) for k in keys} for o in deep_out[:16]]
     for o in top: o["lo52"] = o.pop("lo"); o["hi52"] = o.pop("hi")
