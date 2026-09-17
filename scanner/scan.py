@@ -257,6 +257,43 @@ def on_threshold(t, exch):
         return True if (other and t in other) else None
     return t in lst
 
+def attention(t):
+    """StockTwits messages in the last 24h for this symbol. Free and keyless; the public stream endpoint
+    returns the 30 most recent messages with timestamps, so the count saturates at 30 — plenty for a
+    sub-$10 name, where 30 posts in a day IS the signal. Called in full mode only (rate limits)."""
+    try:
+        r = requests.get(f"https://api.stocktwits.com/api/2/streams/symbol/{t}.json",
+                         headers={"User-Agent": BROWSER_UA, "Accept": "application/json"}, timeout=12)
+        if r.status_code != 200: return None
+        msgs = r.json().get("messages") or []
+        cut = datetime.now(timezone.utc) - timedelta(hours=24)
+        n = 0
+        for m in msgs:
+            try:
+                ts = datetime.strptime(m["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                if ts >= cut: n += 1
+            except Exception: pass
+        return n
+    except Exception as e:
+        log.debug("attention %s: %s", t, e); return None
+
+def zscore(kind, t, value, days=30):
+    """Log today's value and return (z vs our own history, mean) once we have >= 7 samples. Rate of change
+    of attention is what matters, never the level: 20->400 mentions beats 8000->8100."""
+    try:
+        if value is None: return None, None
+        d = DATA_ROOT / kind; d.mkdir(parents=True, exist_ok=True); f = d / f"{t}.json"
+        hist = json.load(open(f)) if f.exists() else {}
+        hist[datetime.now(ET).strftime("%Y-%m-%d")] = int(value)
+        hist = dict(sorted(hist.items())[-120:]); json.dump(hist, open(f, "w"), separators=(",", ":"))
+        cutoff = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d"); today = datetime.now(ET).strftime("%Y-%m-%d")
+        past = [v for k, v in sorted(hist.items()) if cutoff <= k < today]
+        if len(past) < 7: return None, None
+        mu = float(np.mean(past)); sd = float(np.std(past)) or 1.0
+        return round((value - mu) / sd, 2), round(mu, 1)
+    except Exception as e:
+        log.debug("zscore %s %s: %s", kind, t, e); return None, None
+
 def log_metric(kind, t, value, days=30):
     """Append today's value to data/<kind>/<T>.json and report the change vs the oldest sample in the window.
     The LEVEL says how crowded a short is; the TREND says whether shorts are actually being forced."""
@@ -415,6 +452,7 @@ def stage1_calls(kind="calls"):
         x["borrow"] = borrow_info(x["t"]); time.sleep(0.2)
         x["dil"], x["k8"] = edgar_recent(x["t"])
         x["shrg"] = share_growth(x["t"])
+        x["att"] = attention(x["t"]); x["att_z"], x["att_mu"] = zscore("att", x["t"], x["att"]); time.sleep(0.3)
     log.info("%s stage1: universe=%d pass=%d deep=%d · borrow %d/%d, filings %d/%d", kind, len(rows), len(keep), len(top),
              sum(1 for x in top if x.get("borrow")), len(top), sum(1 for x in top if x.get("dil") is not None), len(top))
     return len(rows), len(keep), top
@@ -594,7 +632,16 @@ def deep(x, side):
             sir = x.get("si_rep")                              # exchange-reported change between the last two settlement dates
             if sir is not None: fuel += 3 if sir >= 25 else (2 if sir >= 10 else 0)
             if x.get("ftd"): fuel += 2                         # Reg SHO threshold list = persistent failures to deliver
+            if (x.get("inst") or 0) >= 40: fuel += 2           # institutions sit on it: the effective tradable float is smaller still
             fuel = min(fuel, 35)
+            # Ignition inputs shared by both call boards
+            bench = (MKT or {}).get("bench") or {}
+            o["rs5"] = round(float(cl[-1] / cl[-6] - 1) * 100 - (bench.get("iwm5") or 0), 1) if len(cl) > 6 and bench.get("iwm5") is not None else None
+            o["rs10"] = round(float(cl[-1] / cl[-11] - 1) * 100 - (bench.get("iwm10") or 0), 1) if len(cl) > 11 and bench.get("iwm10") is not None else None
+            rng = float(hi[-1] - lo[-1]); o["clpos"] = round(float(cl[-1] - lo[-1]) / rng, 2) if rng > 0 else None     # where today closed in its range
+            o["sma20_up"] = bool(len(cl) >= 25 and cl[-20:].mean() > cl[-25:-5].mean())
+            att_z = x.get("att_z"); apts = 3 if (att_z or 0) >= 2 else (1 if (att_z or 0) >= 1 else 0)
+            if apts: flags.append(f"attention {x.get('att')} posts/24h vs {x.get('att_mu')} avg")
             gpts, gflags = gamma_pts(o.get("gam")); flags += gflags
             if side == "calls":
                 bot = 0
@@ -605,7 +652,8 @@ def deep(x, side):
                 if o["low20"] <= 8 or (o["lo"] is not None and o["lo"] <= 15): bot += 5
                 if o["vr"] >= 1.3: bot += 5
                 if o["pm_chg"] is not None and 2 <= o["pm_chg"] <= 15: bot += 3
-                bot = min(bot + gpts, 35)
+                if (o["rs5"] or 0) > 0: bot += 2                                        # already outperforming small caps off the low
+                bot = min(bot + gpts + apts, 35)
                 setup = fuel + bot - (5 if o["up3d"] < -10 else 0)
                 if o["up3d"] < -10: flags.append(f"still falling ({o['up3d']}% / 3d)")
                 if o["rsiUp"]: flags.append("RSI turning up")
@@ -632,7 +680,11 @@ def deep(x, side):
                 if 50 <= o["rsi"] <= 72: brk += 4
                 elif o["rsi"] > 78: brk -= 3
                 if o["pm_chg"] is not None and 1 <= o["pm_chg"] <= 12: brk += 3
-                bot = min(max(brk, 0) + gpts, 35)
+                if (o["rs5"] or 0) > 5: brk += 3                                         # relative strength vs IWM, not just up
+                if (o["rs10"] or 0) > 8: brk += 3
+                if o["clpos"] is not None and o["clpos"] >= 0.8: brk += 2                # closed in the top fifth of its range
+                if o["sma20_up"]: brk += 2
+                bot = min(max(brk, 0) + gpts + apts, 35)
                 setup = fuel + bot - (6 if o["up3d"] > 25 else 0)          # chasing something already vertical is how you buy the top
                 if o["up3d"] > 25: flags.append(f"already vertical (+{o['up3d']}% / 3d)")
                 if o["hh"]: flags.append("higher highs and lows")
@@ -641,6 +693,8 @@ def deep(x, side):
                 if o["coil"]: flags.append("coiling under resistance")
                 if o["recl50"]: flags.append("reclaimed 50-day")
                 if o["stack"]: flags.append("above 20 & 50-day")
+                if (o["rs5"] or 0) > 5: flags.append(f"+{o['rs5']}pp vs IWM / 5d")
+                if o["clpos"] is not None and o["clpos"] >= 0.8: flags.append("closed near the high")
             if o["vr"] >= 1.3: flags.append(f"volume pickup {o['vr']}x")
             if b.get("fee") is not None and b["fee"] >= 20: flags.append(f"borrow fee {b['fee']}%")
             if b.get("avail") is not None and b["avail"] < 100_000: flags.append(f"{b['avail']:,} shares to borrow")
@@ -701,7 +755,7 @@ def deep(x, side):
             o["fltm"] = float_pts(x.get("flt"))[1]
             o.update(fuel=round(press, 1), bot=top_)
         if o["pm_chg"] is not None and abs(o["pm_chg"]) >= 2: flags.append(f"pre-market {o['pm_chg']:+}%")
-        if o.get("earn_in"): setup -= 8; flags.append(f"earnings inside window ({o.get('earn')})")
+        if o.get("earn_in"): flags.append(f"earnings inside window ({o.get('earn')}) — binary")
         elif re.match(r"^[A-Z][a-z]{2} \d", o.get("earn") or ""):
             m = datetime.now(ET).month; mn = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
             if re.match(f"^({mn[m-1]}|{mn[m % 12]})", o["earn"]): flags.append(f"earnings {o['earn']}")
@@ -722,7 +776,8 @@ def deep(x, side):
         o["mkt"] = mk
         if mk is not None: s = 0.85 * s + 0.15 * mk
         o.update(flags=flags, setup=round(clamp(setup, 0, 70), 1), opt=round(opt, 1),
-                 score=round(s if o["play"] else min(s, 40), 1))
+                 score=round(s if o["play"] else min(s, 40), 1),
+                 pot=round(o["fuel"] / 35 * 100), imm=round(o["bot"] / 35 * 100))   # how explosive vs. is it starting now
     except Exception as e:
         log.warning("%s: %s", x["t"], e); o["err"] = str(e)[:120]; o["score"] = -1
     return o
@@ -746,7 +801,7 @@ def _clean(v):
 
 def assemble(side, mode, universe, pass1, top_in, deep_out, full_asof):
     keys = ("t","co","px","sf","sr","rsi","rsi3","lo","hi","low20","high20","up3d","vr","pq","pm","pw","p10","s20","av","mc","earn",
-            "runway","dil","ipo_days","gapfail","borrow","k8","shrg","flt","fltm","ins","si_date","si_chg","fee_chg","avail_chg","gam","mkt","exch","sf_src","inst","ss","ssp","ssp_date","si_rep","ftd","atr","dv","rv10","h20","h50","hh","stack","coil","recl50","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
+            "runway","dil","ipo_days","gapfail","borrow","k8","shrg","flt","fltm","ins","si_date","si_chg","fee_chg","avail_chg","gam","mkt","exch","sf_src","att","att_z","att_mu","rs5","rs10","clpos","sma20_up","pot","imm","inst","ss","ssp","ssp_date","si_rep","ftd","atr","dv","rv10","h20","h50","hh","stack","coil","recl50","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
             "fuel","bot","opt","setup","score","flags","play","dud","alts","closes","err")
     top = [{k: o.get(k) for k in keys} for o in deep_out[:16]]
     for o in top: o["lo52"] = o.pop("lo"); o["hi52"] = o.pop("hi")
