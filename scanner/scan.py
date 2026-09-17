@@ -539,7 +539,12 @@ def stage1_puts():
 
 # --------------------------------------------------------------------------- stage 2 · deep scan (both sides)
 def pick_contracts(tk, side, px, c, ivpen=0, adv=None):
-    now = datetime.now(timezone.utc); lst = []; atm_iv = None; gam = None
+    """Two contracts per name. `lst` is the playbook pick: best OTM contract under the ask cap (a lottery ticket that
+    needs a big move). `near` is the closer strike — within 15% of spot, breakeven <= 25%, ask up to ~15% of the
+    share price, 21-45 DTE, OI >= 50, spread <= 40%. Same signal, two ways to express it; the tracker scores both
+    so the question "does the cheap far-out call or the closer strike actually pay on these setups" gets an answer."""
+    now = datetime.now(timezone.utc); lst = []; closer = []; atm_iv = None; gam = None
+    near_cap = max(0.50, 0.15 * px)
     exps = []
     for e in tk.options:
         dte = (datetime.strptime(e, "%Y-%m-%d").replace(tzinfo=timezone.utc) - now).days + 1
@@ -556,9 +561,18 @@ def pick_contracts(tk, side, px, c, ivpen=0, adv=None):
         for r in table.itertuples():
             ask = float(r.ask or 0); bid = float(r.bid or 0); last = float(r.lastPrice or 0); k = float(r.strike)
             otm = k >= px * 0.98 if side == "calls" else k <= px * 1.02
-            if not (ask > 0 and ask <= c["max_ask"] and otm): continue
+            if not (ask > 0 and otm): continue
             oi = int(r.openInterest) if r.openInterest == r.openInterest else 0
             abs_sp = ask - bid; spread = abs_sp / ask
+            be_n = ((k + ask) / px - 1) * 100 if side != "puts" else (1 - (k - ask) / px) * 100
+            close_strike = (k <= px * 1.15) if side != "puts" else (k >= px * 0.85)
+            if close_strike and ask <= near_cap and dte >= 21 and oi >= 50 and spread <= 0.40 and be_n <= 25 and (bid > 0 or last > 0):
+                q2 = clamp(1 - be_n / 25, 0, 1) * 12 + (1 - spread) * 8 + clamp(oi, 0, 2000) / 2000 * 10
+                closer.append(dict(exp=e, dte=dte, strike=k, bid=round(bid, 2), ask=round(ask, 2), last=round(last, 2), oi=oi,
+                                 vol=int(r.volume) if r.volume == r.volume else 0,
+                                 iv=round(float(r.impliedVolatility) * 100) if r.impliedVolatility == r.impliedVolatility else None,
+                                 be=round(be_n, 1), spread=round(spread * 100), q=round(q2, 1)))
+            if ask > c["max_ask"]: continue
             if oi < c["min_oi"] or (spread > 0.75 and abs_sp > 0.10): continue
             be = ((k + ask) / px - 1) * 100 if side == "calls" else (1 - (k - ask) / px) * 100   # % move needed, positive number
             if be > c["max_be"] or not (bid > 0 or last > 0): continue
@@ -567,8 +581,8 @@ def pick_contracts(tk, side, px, c, ivpen=0, adv=None):
             lst.append(dict(exp=e, dte=dte, strike=k, bid=round(bid, 2), ask=round(ask, 2), last=round(last, 2), oi=oi,
                             vol=int(r.volume) if r.volume == r.volume else 0, iv=iv, be=round(be, 1), spread=round(spread * 100), q=round(q, 1)))
         time.sleep(0.25)
-    lst.sort(key=lambda z: -z["q"])
-    return lst, atm_iv, gam
+    lst.sort(key=lambda z: -z["q"]); closer.sort(key=lambda z: -z["q"])
+    return lst, atm_iv, gam, (closer[0] if closer else None)
 
 # Measured on 2y of daily history for today's shorted $1-10 universe (211 names, 9,267 pattern days; survivorship-biased,
 # entry = next day's open). Baseline for a random day on these names: 34% reach +20% within 20 sessions, 11% reach +50%.
@@ -641,8 +655,8 @@ def deep(x, side):
         earn_ts = info.get("earningsTimestampStart") or info.get("earningsTimestamp") or x.get("earn_ts")
         if info.get("earningsTimestampStart"): o["earn"] = earn_label(info)
         # IV rank: our own log once it has 20+ days, else realized-vol percentile as a proxy
-        contracts, atm_iv, gam = pick_contracts(tk, side, px, c, adv=x.get("av"))
-        o["gam"] = gam
+        contracts, atm_iv, gam, near = pick_contracts(tk, side, px, c, adv=x.get("av"))
+        o["gam"] = gam; o["play2"] = near                     # the closer strike, scored by the tracker alongside the playbook pick
         ivr = iv_rank(x["t"], atm_iv); o["ivr"] = ivr; o["ivr_src"] = "iv" if ivr is not None else "hv"
         if ivr is None: ivr = x.get("hvp")
         o["iv_rank"] = ivr; o["atm_iv"] = atm_iv
@@ -653,6 +667,7 @@ def deep(x, side):
         # A contract only counts as tradeable if its quality is actually positive. A zero bid with a 100%
         # spread and a breakeven halfway to the moon is not a play, and shouldn't pass the gate.
         o["play"] = contracts[0] if contracts and contracts[0]["q"] > 0 else None; o["alts"] = contracts[1:3]
+        if o["play"] and o.get("play2") and (o["play2"]["exp"], o["play2"]["strike"]) == (o["play"]["exp"], o["play"]["strike"]): o["play2"] = None
         if o["play"] is None and contracts: o["dud"] = contracts[0]     # keep it visible on the card
         opt = o["play"]["q"] if o["play"] else 0
         flags = []
@@ -867,7 +882,7 @@ def _clean(v):
 def assemble(side, mode, universe, pass1, top_in, deep_out, full_asof):
     keys = ("t","co","px","sf","sr","rsi","rsi3","lo","hi","low20","high20","up3d","vr","pq","pm","pw","p10","s20","av","mc","earn",
             "runway","dil","ipo_days","gapfail","borrow","k8","shrg","flt","fltm","ins","si_date","si_chg","fee_chg","avail_chg","gam","mkt","exch","sf_src","att","att_z","att_mu","rs5","rs10","clpos","sma20_up","pot","imm","trig","inst","ss","ssp","ssp_date","si_rep","ftd","atr","dv","rv10","h20","h50","hh","stack","coil","recl50","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
-            "fuel","bot","opt","setup","score","flags","play","dud","alts","closes","err")
+            "fuel","bot","opt","setup","score","flags","play","play2","dud","alts","closes","err")
     top = [{k: o.get(k) for k in keys} for o in deep_out[:16]]
     for o in top: o["lo52"] = o.pop("lo"); o["hi52"] = o.pop("hi")
     rest = [[o["t"], o.get("px"), o.get("sf"), o.get("rsi"), o.get("score"), 1 if o.get("play") else 0] for o in deep_out[16:]]
