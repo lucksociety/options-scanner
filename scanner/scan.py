@@ -42,10 +42,10 @@ SIDES = ("calls", "puts", "breakout")
 MKT = None          # market regime, scored once per run (scanner/market.py)
 
 CFG = {
-    "calls": dict(price_min=1.0, price_max=10.0, si_min=15.0, avgvol_min=300_000, deep_n=40,
+    "calls": dict(price_min=1.0, price_max=10.0, si_min=15.0, avgvol_min=300_000, dv_min=1.0, deep_n=40,   # dv_min = $M traded a day
                   min_dte=14, max_dte=45, max_ask=0.25, min_oi=25, max_be=60.0),
     # same universe as calls (heavily shorted and cheap) but timed off momentum instead of a bottom
-    "breakout": dict(price_min=1.0, price_max=10.0, si_min=15.0, avgvol_min=300_000, deep_n=40,
+    "breakout": dict(price_min=1.0, price_max=10.0, si_min=15.0, avgvol_min=300_000, dv_min=1.0, deep_n=40,
                      min_dte=14, max_dte=45, max_ask=0.35, min_oi=25, max_be=60.0),
     "puts":  dict(price_min=3.0, price_max=50.0, si_max=15.0, avgvol_min=500_000, deep_n=40,
                   run5_min=15.0, run10_min=25.0, ext20_min=20.0, gap_min=12.0,       # "ran too far" triggers (any one) — RSI alone is NOT a ticket in
@@ -213,26 +213,49 @@ def key_stats(info, r):
     r["ss"], r["ssp"] = ss, ssp
     r["ssp_date"] = _ts(info.get("sharesShortPreviousMonthDate"))
     r["si_rep"] = round((ss / ssp - 1) * 100, 1) if (ss and ssp) else None   # change between the two reports
+    r["exch"] = info.get("exchange")                                          # NMS/NGM/NCM = Nasdaq, NYQ = NYSE, ASE = NYSE American
+    r["state"] = info.get("marketState")                                      # PRE / REGULAR / POST / CLOSED
+    # Yahoo's shortPercentOfFloat is sometimes missing or zero while the raw counts are fine: derive it rather than drop the name.
+    if not r.get("sf") and ss and r["flt"]:
+        r["sf"] = round(ss / r["flt"] * 100, 2); r["sf_src"] = "derived"
 
 _regsho = None
 def regsho():
-    """Reg SHO threshold list (persistent failures to deliver). Nasdaq publishes it daily; SEC's own copy
-    blocks our runner. Missing list = unknown, never scored as clean."""
+    """Reg SHO threshold lists (persistent failures to deliver). Each exchange publishes its own; SEC's copy
+    blocks our runner. Returns {"nasdaq": set|None, "nyse": set|None} — None means that list could not be
+    loaded, so names on that exchange read as UNKNOWN, never as clean."""
     global _regsho
     if _regsho is not None: return _regsho
-    _regsho = set()
-    for back in (0, 1, 2, 3):
-        d = (datetime.now(ET) - timedelta(days=back)).strftime("%Y%m%d")
-        try:
-            r = requests.get(f"https://www.nasdaqtrader.com/dynamic/symdir/regsho/nasdaqth{d}.txt",
-                             headers={"User-Agent": BROWSER_UA}, timeout=15)
-            if r.status_code == 200 and "|" in r.text:
-                _regsho = {ln.split("|")[0].strip().upper() for ln in r.text.splitlines()[1:] if "|" in ln}
-                log.info("reg sho: %d threshold securities (%s)", len(_regsho), d); return _regsho
-        except Exception as e:
-            log.debug("regsho %s: %s", d, e)
-    log.warning("reg sho: threshold list unavailable — FTD pressure will read as unknown")
+    _regsho = {"nasdaq": None, "nyse": None}
+    for back in (0, 1, 2, 3, 4):
+        d = datetime.now(ET) - timedelta(days=back); ds = d.strftime("%Y%m%d")
+        if _regsho["nasdaq"] is None:
+            try:
+                r = requests.get(f"https://www.nasdaqtrader.com/dynamic/symdir/regsho/nasdaqth{ds}.txt",
+                                 headers={"User-Agent": BROWSER_UA}, timeout=15)
+                if r.status_code == 200 and "|" in r.text:
+                    _regsho["nasdaq"] = {ln.split("|")[0].strip().upper() for ln in r.text.splitlines()[1:] if "|" in ln}
+            except Exception as e: log.debug("regsho nasdaq %s: %s", ds, e)
+        if _regsho["nyse"] is None:
+            try:
+                r = requests.get("https://www.nyse.com/api/regulatory/threshold-securities/download",
+                                 params={"selectedDate": d.strftime("%Y-%m-%d"), "market": "ALL"},
+                                 headers={"User-Agent": BROWSER_UA}, timeout=15)
+                if r.status_code == 200 and "|" in r.text:
+                    _regsho["nyse"] = {ln.split("|")[0].strip().upper() for ln in r.text.splitlines()[1:] if "|" in ln}
+            except Exception as e: log.debug("regsho nyse %s: %s", ds, e)
+        if _regsho["nasdaq"] is not None and _regsho["nyse"] is not None: break
+    log.info("reg sho: nasdaq %s · nyse %s", *(("%d names" % len(v)) if v is not None else "unavailable" for v in (_regsho["nasdaq"], _regsho["nyse"])))
     return _regsho
+
+def on_threshold(t, exch):
+    """True / False / None(unknown) for this ticker given its listing exchange."""
+    th = regsho(); t = t.upper()
+    lst = th["nasdaq"] if (exch or "").upper() in ("NMS", "NGM", "NCM", "NAS") else th["nyse"]
+    if lst is None:
+        other = th["nyse"] if lst is th["nasdaq"] else th["nasdaq"]
+        return True if (other and t in other) else None
+    return t in lst
 
 def log_metric(kind, t, value, days=30):
     """Append today's value to data/<kind>/<T>.json and report the change vs the oldest sample in the window.
@@ -302,7 +325,10 @@ def iv_rank(t, iv_now):
         log.debug("iv log %s: %s", t, e); return None
 
 def premarket(info):
-    """Yahoo pre-market quote if we're in the pre-market session (else None)."""
+    """Yahoo pre-market quote, only while the pre-market session is actually on. Yahoo keeps the last
+    pre-market print in `preMarketPrice` all day, so without the marketState check a 7am tick was
+    scoring bottoming points and a "pre-market +x%" flag at 3pm."""
+    if (info.get("marketState") or "").upper() != "PRE": return None
     p = info.get("preMarketPrice"); prev = info.get("regularMarketPreviousClose") or info.get("previousClose")
     if p and prev: return round(float(p), 2), round((float(p) / float(prev) - 1) * 100, 1)
     return None
@@ -348,9 +374,15 @@ def stage1_calls(kind="calls"):
             key_stats(info, r)
         except Exception as e: log.warning("info %s: %s", r["t"], e)
         time.sleep(0.15)
-    keep = [x for x in rows if x["av"] >= c["avgvol_min"] and x["sf"] >= c["si_min"]]
+    keep = [x for x in rows if x["av"] >= c["avgvol_min"] and x["sf"] >= c["si_min"] and (x.get("dv") or 0) >= c.get("dv_min", 0)]
     for x in keep:
-        s = min(x["sf"], 60) / 60 * 35 + min(x["sr"] or 0, 10) / 10 * 10
+        x["ftd"] = on_threshold(x["t"], x.get("exch"))
+        # Squeeze fuel is scored here too, not only after the cut: otherwise a 15M-float name at 30% short
+        # loses its deep-scan slot to a 300M-float name at 35% and the float weight never gets a say.
+        s = min(x["sf"], 60) / 60 * 30 + min(x["sr"] or 0, 10) / 10 * 8 + float_pts(x.get("flt"))[0]
+        sir = x.get("si_rep")
+        if sir is not None: s += 4 if sir >= 25 else (2 if sir >= 10 else 0)
+        if x.get("ftd"): s += 3
         if kind == "calls":                                   # bottoming: beaten down, starting to turn
             if 25 <= x["rsi"] <= 45: s += 15
             elif 45 < x["rsi"] <= 55: s += 8
@@ -379,12 +411,10 @@ def stage1_calls(kind="calls"):
         if len(top) >= c["deep_n"]: break
         if has_options(x["t"]): top.append(x)
         time.sleep(0.1)
-    th = regsho()
     for x in top:
         x["borrow"] = borrow_info(x["t"]); time.sleep(0.2)
         x["dil"], x["k8"] = edgar_recent(x["t"])
         x["shrg"] = share_growth(x["t"])
-        x["ftd"] = (x["t"].upper() in th) if th else None      # None = list unavailable, not "clean"
     log.info("%s stage1: universe=%d pass=%d deep=%d · borrow %d/%d, filings %d/%d", kind, len(rows), len(keep), len(top),
              sum(1 for x in top if x.get("borrow")), len(top), sum(1 for x in top if x.get("dil") is not None), len(top))
     return len(rows), len(keep), top
@@ -462,6 +492,7 @@ def stage1_puts():
         x["dil"], x["k8"] = edgar_recent(x["t"])
         x["shrg"] = share_growth(x["t"])
         x["borrow"] = borrow_info(x["t"]); time.sleep(0.2)
+        x["ftd"] = on_threshold(x["t"], x.get("exch"))
     log.info("puts stage1: universe=%d pass=%d deep=%d · borrow %d/%d, filings %d/%d, share-count %d/%d", len(syms), len(keep), len(top),
              sum(1 for x in top if x.get("borrow")), len(top), sum(1 for x in top if x.get("dil") is not None), len(top),
              sum(1 for x in top if x.get("shrg") is not None), len(top))
@@ -551,11 +582,15 @@ def deep(x, side):
                 fuel += 2 if b["avail"] < 100_000 else (1 if b["avail"] < 500_000 else 0)
             else:
                 fuel *= 35 / 29            # no borrow feed: rescale rather than strand 6 pts for everyone
-            # trend beats level: shorts piling in, or borrow getting expensive, is the actual tell
+            # trend beats level: shorts piling in, or borrow getting expensive, is the actual tell.
+            # Our own SI log only moves when the exchange report does, so it is NOT scored (that would count
+            # the same event twice with si_rep below); it is logged for the card. Borrow fee/availability
+            # are daily data, so their 30-day change is real information.
             o["si_chg"] = log_metric("si", x["t"], o.get("sf"))
             o["fee_chg"] = log_metric("fee", x["t"], b.get("fee"))
-            if (o["si_chg"] or 0) >= 2: fuel += 2
+            o["avail_chg"] = log_metric("avail", x["t"], b.get("avail"))
             if (o["fee_chg"] or 0) >= 5: fuel += 2
+            if b.get("avail") and o["avail_chg"] is not None and o["avail_chg"] <= -0.5 * (b["avail"] - o["avail_chg"]): fuel += 1   # shares to borrow halved
             sir = x.get("si_rep")                              # exchange-reported change between the last two settlement dates
             if sir is not None: fuel += 3 if sir >= 25 else (2 if sir >= 10 else 0)
             if x.get("ftd"): fuel += 2                         # Reg SHO threshold list = persistent failures to deliver
@@ -614,7 +649,13 @@ def deep(x, side):
             if (o.get("fee_chg") or 0) >= 5: flags.append(f"borrow fee +{o['fee_chg']}pp")
             if (x.get("si_rep") or 0) >= 10: flags.append(f"shorts added {x['si_rep']}% since {x.get('ssp_date') or 'last report'}")
             if x.get("ftd"): flags.append("Reg SHO threshold list")
-            if (x.get("shrg") or 0) >= 15: setup -= 3; flags.append(f"shares +{x['shrg']}% in 6mo")   # they keep printing stock
+            # Dilution is the squeeze killer: a company that sells stock into every rally caps the move. Graded, not a nudge.
+            g = x.get("shrg") or 0
+            if g >= 50: setup -= 12; flags.append(f"heavy dilution: shares +{g}% in 6mo")
+            elif g >= 25: setup -= 8; flags.append(f"dilution: shares +{g}% in 6mo")
+            elif g >= 10: setup -= 4; flags.append(f"shares +{g}% in 6mo")
+            if o.get("avail_chg") is not None and b.get("avail") and o["avail_chg"] < 0 and -o["avail_chg"] >= 0.5 * (b["avail"] - o["avail_chg"]):
+                flags.append("shares to borrow halved in 30d")
             o.update(fuel=round(fuel, 1), bot=bot)
         else:
             o["rsiDown"] = o["rsi"] < o["rsi3"]
@@ -653,6 +694,7 @@ def deep(x, side):
             elif (x.get("shrg") or 0) >= 5: flags.append(f"shares +{x['shrg']}% in 6mo")
             if x.get("runway") is not None and x["runway"] < 1: flags.append(f"cash runway {x['runway']}y")
             if x.get("ipo_days") is not None and 150 <= x["ipo_days"] <= 200: flags.append("lockup window")
+            if x.get("ftd"): press -= 4; flags.append("on the Reg SHO threshold list — squeeze risk against you")
             o["si_chg"] = log_metric("si", x["t"], o.get("sf")); o["fee_chg"] = log_metric("fee", x["t"], b.get("fee"))
             gp = gamma_pts(o.get("gam"))[0]
             if gp >= 4: press -= 3; flags.append("heavy call positioning against you")   # gamma cuts the other way on puts
@@ -704,7 +746,7 @@ def _clean(v):
 
 def assemble(side, mode, universe, pass1, top_in, deep_out, full_asof):
     keys = ("t","co","px","sf","sr","rsi","rsi3","lo","hi","low20","high20","up3d","vr","pq","pm","pw","p10","s20","av","mc","earn",
-            "runway","dil","ipo_days","gapfail","borrow","k8","shrg","flt","fltm","ins","si_date","si_chg","fee_chg","gam","mkt","inst","ss","ssp","ssp_date","si_rep","ftd","atr","dv","rv10","h20","h50","hh","stack","coil","recl50","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
+            "runway","dil","ipo_days","gapfail","borrow","k8","shrg","flt","fltm","ins","si_date","si_chg","fee_chg","avail_chg","gam","mkt","exch","sf_src","inst","ss","ssp","ssp_date","si_rep","ftd","atr","dv","rv10","h20","h50","hh","stack","coil","recl50","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
             "fuel","bot","opt","setup","score","flags","play","dud","alts","closes","err")
     top = [{k: o.get(k) for k in keys} for o in deep_out[:16]]
     for o in top: o["lo52"] = o.pop("lo"); o["hi52"] = o.pop("hi")
