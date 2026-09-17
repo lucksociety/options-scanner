@@ -149,8 +149,10 @@ def regime():
                "unknown": "Market data unavailable."}[band]
     out = dict(asof=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
                score=score, band=band, verdict=verdict, parts=parts, weights=WEIGHTS,
-               bench={k: (round(_chg(iwm, n), 2) if iwm is not None and _chg(iwm, n) is not None else None)
-                      for k, n in (("iwm5", 5), ("iwm10", 10), ("iwm20", 20))},
+               bench={**{k: (round(_chg(iwm, n), 2) if iwm is not None and _chg(iwm, n) is not None else None)
+                         for k, n in (("iwm5", 5), ("iwm10", 10), ("iwm20", 20))},
+                      **{k: (round(_chg(spy, n), 2) if spy is not None and _chg(spy, n) is not None else None)
+                         for k, n in (("spy5", 5), ("spy10", 10))}},
                measured=measured, missing=missing, notes=notes)
     log.info("market regime %s (%s) · %s", score, band, "; ".join(notes))
     return out
