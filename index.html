@@ -81,6 +81,7 @@ main{max-width:1180px;margin:0 auto;padding-inline:clamp(16px,4vw,48px)}
 .score{text-align:right;grid-column:6;grid-row:1;min-width:0} .num{font-size:30px;font-weight:600;line-height:1}
 .bar{display:flex;height:6px;background:var(--bg3);border-radius:3px;overflow:hidden;margin:8px 0 6px}
 .bar i{display:block;height:100%} i.f{background:var(--fuel)} i.b{background:var(--bot)} i.o{background:var(--opt)}
+.pi{font-size:10.5px;color:var(--ink3);white-space:nowrap;margin-top:4px;text-align:right} .pi b{color:var(--ink2);font-weight:600}
 .legend{display:grid;justify-items:end;gap:2px;font-size:10.5px;color:var(--ink3);white-space:nowrap}
 .legend i{display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:3px;vertical-align:middle}
 table{width:100%;border-collapse:collapse;background:var(--bg2);border:1px solid var(--line);border-radius:6px;overflow:hidden;font-size:13.5px}
@@ -136,6 +137,7 @@ select{font:500 13px "IBM Plex Sans",sans-serif;color:var(--ink);background:var(
       <span class="age" id="age"><i></i><span id="ageText">loading…</span></span>
       <span id="modeText" class="dim"></span>
       <select id="histSel" title="Look back at a previous morning's board"><option value="">Latest</option></select>
+      <select id="sortSel" title="Score = potential and imminence together · Potential = how explosive if it goes · Imminence = is it starting now"><option value="score">By score</option><option value="pot">By potential</option><option value="imm">By imminence</option></select>
       <button id="refreshBtn" title="Re-fetch the latest results now">Refresh</button>
       <button id="scanBtn" class="primary" title="Start a new scan on GitHub Actions">Scan now</button>
       <button id="setupBtn" title="Connect this page to your GitHub repo so Scan now works">⚙</button>
@@ -163,6 +165,7 @@ const SIDES={calls:{path:'data/latest.json',letter:'C',eyebrow:'Pre-market · he
  breakout:{path:'data/breakout/latest.json',letter:'C',eyebrow:'Already turning · heavily shorted · under $10',f1:'Optionable, <$10, SI ≥ 15%',f2:'Passed screen',f3:'Deep-scanned',f4:'With a call ≤ $0.35',rule:'Same shorted universe as the Calls board, timed off momentum instead of a bottom: names already trending — higher highs and lows, above the 20 and 50-day, coiling or pressing the 20-day high on rising volume. Contract quality is a gate, not a boost. Top 3 in gold.',none:'No liquid call ≤ $0.35 in the 2–6 wk window',legend:['fuel','breakout','contract'],watch:'Shorted and trending, but no liquid call at or under $0.35 expiring in 2–6 weeks, or scored below the cut.',m1:['Squeeze fuel (0–35)','Short float (up to 15), float size (up to 8 — under 10M shares is worth the most), days to cover (up to 6), borrow fee and shares available (up to 6), plus 2 each when short interest is rising 2pp or the borrow fee is up 5pp over the last month. Same fuel as the Calls board: what happens if it runs.'],m2:['Breakout (0–35)','Higher highs and higher lows over the last 10 sessions vs the 10 before (+6), price above the 20-day with the 20 above the 50 (+6, or +3 just above the 20-day), within 3% of the 20-day high (+8) or 8% (+4), the 10-day range compressed under 60% of the prior 20-day range (+5), a 50-day reclaim in the last week (+4), volume 2× the 20-day (+8) or 1.3× (+5), RSI 50–72 (+4) while RSI over 78 costs 3, a 1–12% pre-market bid (+3), plus call positioning (up to 8). Already up more than 25% in 3 days costs 6 — that is chasing.'],m3:['Contract (0–30)','Best out-of-the-money call with ask ≤ $0.35 — higher than the Calls board, because names already pressing highs price their cheap calls much further out — expiring 14–45 days out, open interest ≥ 25 and a workable spread; anything needing more than a 60% move is excluded. Scored 0–30 — a gate and a tiebreak, not part of the ranking.']},
  puts:{path:'data/puts/latest.json',letter:'P',eyebrow:'Overextended · forced sellers · $3–$50',f1:'$3–50, vol ≥ 500K, SI < 15%',f2:'Ran too far, too fast',f3:'Deep-scanned',f4:'With a put ≤ $0.35',rule:'Ranked by downside setup: how far it ran, extension, cash burn, dilution, and topping signals. Contract quality is a gate, not a boost \u2014 no liquid put means capped and sorted last, but a cheap put never lifts a weak setup. Top 3 in gold.',none:'No liquid put ≤ $0.35 in the 3–6 wk window',legend:['pressure','topping','contract'],watch:'Ran hard but no liquid put at or under $0.35 expiring in 3–6 weeks, or scored below the cut.',m1:['Downside pressure (0–35)','Size of the 5/10-day run (up to 12), extension above the 20-day average (up to 8), short float under 8% so a squeeze can\'t run you over (+3), cash runway under 1 year (+6) or 2 years (+3), shares outstanding up 10%+ over 6 months (+6) or 5%+ (+3) — real dilution measured from the share count, since sec.gov blocks our servers — IPO lockup expiring (+4).'],m2:['Topping (0–35)','RSI ≥ 70 (+8) or ≥ 60 (+4), RSI lower than 3 sessions ago (+8), closed below the prior day\'s low (+7), a 12%+ gap up in the last week that has since failed (+6), no new high in 3 sessions (+5), volume fading from the peak day (+4), already 5% off the 20-day high (+3), gapping down 2%+ pre-market (+3). Still up more than 10% over 3 days costs 5 — don\'t step in front of it.'],m3:['Contract (0–30)','Best out-of-the-money put with ask ≤ $0.35, expiring 21–45 days out, open interest ≥ 25 and a workable spread; anything needing more than a 35% drop is excluded. Scored 0–30 — a gate and a tiebreak, not part of the ranking.']}};
 let side='calls'; try{side=localStorage.getItem('squeeze.side')||'calls'}catch{}
+let sortBy='score'; try{sortBy=localStorage.getItem('squeeze.sort')||'score'}catch{}
 const MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 function code(t,c){const d=new Date(c.exp+'T12:00:00Z');return `${t} ${MON[d.getUTCMonth()]} ${d.getUTCDate()} $${Number(c.strike)%1?c.strike:Number(c.strike).toFixed(0)} ${SIDES[side].letter}`;}
 function spark(closes,w=120,h=32){
@@ -209,7 +212,8 @@ function row(i,o){
   ${play}${alts}
   <div class="score"><div class="num">${Math.round(o.score)}</div>
     <div class="bar" title="setup ${o.setup??'–'}/70 · contract ${o.opt}/30 (gate only)"><i class="f" style="width:${(o.fuel||0)/70*100}%"></i><i class="b" style="width:${(o.bot||0)/70*100}%"></i></div>
-    <div class="legend"><span><i class="f"></i>${SIDES[side].legend[0]} ${Math.round(o.fuel)}</span><span><i class="b"></i>${SIDES[side].legend[1]} ${Math.round(o.bot)}</span><span class="dim">contract ${Math.round(o.opt)}/30</span></div></div>
+    <div class="legend"><span><i class="f"></i>${SIDES[side].legend[0]} ${Math.round(o.fuel)}</span><span><i class="b"></i>${SIDES[side].legend[1]} ${Math.round(o.bot)}</span><span class="dim">contract ${Math.round(o.opt)}/30</span></div>
+    ${o.pot!=null?`<div class="pi" title="Potential: how explosive if it goes (fuel). Imminence: is it starting now (timing).">potential <b>${o.pot}</b> · imminence <b>${o.imm}</b></div>`:''}</div>
   <div class="detail">${det}</div>
 </article>`;
 }
@@ -253,7 +257,7 @@ function render(d){
   ${regimePanel(d.market)}
   ${trackPanel()}
   <div class="rule"><h2>Ranked ${side==='puts'?'put':(side==='breakout'?'breakout call':'call')} plays${histDate?` <span class="hist">· ${histDate}</span>`:''}</h2><p>${S.rule}</p></div>
-  ${d.top.map((o,i)=>row(i+1,o)).join('')}
+  ${[...d.top].sort((a,b)=>(a.play?0:1)-(b.play?0:1)||((b[sortBy]??b.score)-(a[sortBy]??a.score))).map((o,i)=>row(i+1,o)).join('')}
   ${tradesPanel()}
   <div class="rule"><h2>Watchlist</h2><p>${S.watch}</p></div>
   <div class="twrap"><table><thead><tr><th>Ticker</th><th>Price</th><th>Short float</th><th>RSI</th><th>Score</th><th>${side==='puts'?'Put ≤ $0.35':(side==='breakout'?'Call ≤ $0.35':'Call ≤ $0.25')}</th></tr></thead><tbody>
@@ -366,6 +370,7 @@ async function load(manual){
 }
 $('#refreshBtn').onclick=()=>{if(histDate){histDate='';$('#histSel').value='';}track=null;openAll=null;lastAsof=null;load(true);};
 function setSide(sd){side=sd;try{localStorage.setItem('squeeze.side',sd)}catch{};$('#sideCalls').classList.toggle('on',sd==='calls');$('#sideBrk').classList.toggle('on',sd==='breakout');$('#sidePuts').classList.toggle('on',sd==='puts');lastAsof=null;current=null;histDate='';$('#histSel').value='';$('#main').innerHTML='<div class="empty">Loading…</div>';loadHistIndex();load(false);}
+$('#sortSel').value=sortBy; $('#sortSel').onchange=e=>{sortBy=e.target.value;try{localStorage.setItem('squeeze.sort',sortBy)}catch{};if(current)render(current);};
 $('#sideCalls').onclick=()=>setSide('calls');$('#sideBrk').onclick=()=>setSide('breakout');$('#sidePuts').onclick=()=>setSide('puts');setSide(side);
 setInterval(()=>load(false),60000); setInterval(paintAge,15000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)load(false);});
