@@ -46,8 +46,9 @@ def main():
     # everything for the live table. The held-out numbers are the honest ones; the banner shows them.
     cut = int(len(F) * 0.7); train, test = F.iloc[:cut], F.iloc[cut:]
     tab_train = outlook.calibrate(train, train["spy15"])
-    test = test.copy(); test["exp"] = outlook.expected(test, tab_train); test["xband"] = [outlook.exp_band_of(v)[0] for v in test["exp"]]
-    F["exp"] = outlook.expected(F, tab_train); F["xband"] = [outlook.exp_band_of(v)[0] for v in F["exp"]]
+    cuts = tab_train.get("cuts")
+    test = test.copy(); test["exp"] = outlook.expected(test, tab_train); test["xband"] = [outlook.exp_band_of(v, cuts)[0] for v in test["exp"]]
+    F["exp"] = outlook.expected(F, tab_train); F["xband"] = [outlook.exp_band_of(v, cuts)[0] for v in F["exp"]]
     tab_all = outlook.calibrate(F, F["spy15"])
     tab_all["fit"] = dict(train_first=str(train.index[0].date()), train_last=str(train.index[-1].date()),
                           test_first=str(test.index[0].date()), test_last=str(test.index[-1].date()), test_sessions=int(len(test)))
