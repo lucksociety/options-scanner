@@ -16,6 +16,15 @@ Score: bias in roughly -100..+100. Five groups, each explainable on the card:
   reversion    (+/-20)  what mean-reverts inside 3-4 weeks: SPY RSI extremes, stretch from the 50-day, post-panic
                         (VIX spiked above 25 and has since fallen 20%+), drawdown-and-turn
 Bands: >= +30 favor calls · +10..+30 lean calls · -10..+10 mixed · -30..-10 lean puts · <= -30 favor puts
+
+CALIBRATION. The first backtest (2019-2026, 1,734 sessions) showed the raw bias points the WRONG way at this horizon:
+the most bearish readings (panic: VIX spiking, everything under the 50-day) were the best 15-session buys, and the worst
+bucket was a trend that had just rolled over with no panic yet. Trend, breadth and volatility all mean-reverted; only
+risk appetite and the reversion group scored in the intuitive direction. So the live verdict is not the raw bias: each
+component's bucket is mapped to the EXCESS 15-session SPY return that bucket actually produced (shrunk toward zero for
+thin buckets), the five excesses are summed into an expected excess return, and the band comes from that. The raw bias
+is still shown as a descriptor. outlook_backtest.py fits the table on the first ~70% of history and reports the bands'
+hit-rates on the held-out last ~30%, so the banner's odds are not pure in-sample flattery.
 """
 import numpy as np
 import pandas as pd
@@ -25,6 +34,48 @@ TICKERS = ["SPY", "QQQ", "IWM", "RSP", "^VIX", "^VIX3M", "HYG", "IEF", "^TNX"] +
 WEIGHTS = dict(trend=25, breadth=20, vol=20, appetite=15, reversion=20)
 BANDS = [(30, "favor_calls", "Favor calls"), (10, "lean_calls", "Lean calls"), (-10, "mixed", "Mixed"),
          (-30, "lean_puts", "Lean puts"), (-999, "favor_puts", "Favor puts")]
+
+
+PARTS = ("trend", "breadth", "vol", "appetite", "reversion")
+BUCKET = 10                       # component buckets are 10 points wide
+EXP_BANDS = [(0.6, "favor_calls", "Favor calls"), (0.2, "lean_calls", "Lean calls"), (-0.2, "mixed", "Mixed"),
+             (-0.6, "lean_puts", "Lean puts"), (-999, "favor_puts", "Favor puts")]
+
+
+def bucket_key(v):
+    lo = int(np.floor(v / BUCKET) * BUCKET)
+    return f"{lo}..{lo + BUCKET}"
+
+
+def calibrate(F, fwd, shrink=60):
+    """Lookup table {part: {bucket: excess}}: mean forward return of the bucket minus the overall mean, shrunk toward 0
+    by n/(n+shrink) so a 12-session bucket cannot dominate. fwd = forward SPY return series aligned to F."""
+    base = float(fwd.mean()); table = {"base": round(base, 3), "parts": {}}
+    for p in PARTS:
+        keys = F[p].map(bucket_key); t = {}
+        for k in sorted(set(keys), key=lambda x: int(x.split("..")[0])):
+            m = keys == k; n = int(m.sum())
+            if n == 0: continue
+            ex = float(fwd[m].mean()) - base
+            t[k] = dict(n=n, excess=round(ex * n / (n + shrink), 3), raw=round(ex, 3), up=round(float((fwd[m] > 0).mean() * 100), 1))
+        table["parts"][p] = t
+    return table
+
+
+def expected(F, table):
+    """Expected 15-session SPY excess return per session from the calibration table (0 for unseen buckets)."""
+    out = pd.Series(0.0, index=F.index)
+    for p in PARTS:
+        t = table["parts"].get(p, {})
+        out += F[p].map(lambda v: t.get(bucket_key(v), {}).get("excess", 0.0))
+    return out
+
+
+def exp_band_of(x):
+    if x is None or x != x: return "unknown", "Unknown"
+    for lo, key, label in EXP_BANDS:
+        if x >= lo: return key, label
+    return "favor_puts", "Favor puts"
 
 
 def band_of(bias):
@@ -149,14 +200,24 @@ def outlook_frame(hist):
     return F
 
 
-def outlook_today(hist):
-    """The live reading: last row of outlook_frame plus human notes for the banner."""
+def outlook_today(hist, table=None):
+    """The live reading: last row of outlook_frame plus human notes for the banner. With a calibration table the
+    verdict comes from the expected excess return; without one it falls back to the raw bias and says so."""
     F = outlook_frame(hist)
     r = F.iloc[-1]
     def g(k, nd=1):
         v = r.get(k)
         return None if v is None or (isinstance(v, float) and v != v) else (round(float(v), nd) if isinstance(v, (float, int, np.floating, np.integer)) else v)
-    bias = g("bias"); key, label = band_of(bias)
+    bias = g("bias"); raw_key, raw_label = band_of(bias)
+    exp_ = None; contrib = {}
+    if table:
+        exp_ = round(float(expected(F.iloc[[-1]], table).iloc[0]), 2)
+        for p in PARTS:
+            b = table["parts"].get(p, {}).get(bucket_key(float(r[p])), {})
+            contrib[p] = dict(bucket=bucket_key(float(r[p])), excess=b.get("excess"), up=b.get("up"), n=b.get("n"))
+        key, label = exp_band_of(exp_)
+    else:
+        key, label = raw_key, raw_label
     notes = []
     if g("spy_vs50") is not None: notes.append(f"SPY {g('spy_vs50'):+.1f}% vs 50-day, {g('spy_vs20'):+.1f}% vs 20-day")
     if g("sect_pct") is not None: notes.append(f"{g('sect_pct', 0):.0f}% of sectors above their 50-day")
@@ -175,6 +236,10 @@ def outlook_today(hist):
                "lean_puts": "Mild downward tilt over the next 3–4 weeks: puts have the edge, keep calls to fired triggers only.",
                "favor_puts": "Tape favors the short side over the next 3–4 weeks: lean on the Bear board.",
                "unknown": "Outlook data unavailable."}[key]
-    parts = {k: g(k, 1) for k in ("trend", "breadth", "vol", "appetite", "reversion")}
-    return dict(bias=bias, score=round((bias + 100) / 2) if bias is not None else None, band=key, label=label, verdict=verdict,
+    parts = {k: g(k, 1) for k in PARTS}
+    # score for the dial: calibrated expectation mapped so 0 = -1.5% excess, 50 = 0, 100 = +1.5%; raw bias if uncalibrated
+    score = (round(float(np.clip(50 + exp_ / 1.5 * 50, 0, 100))) if exp_ is not None
+             else (round((bias + 100) / 2) if bias is not None else None))
+    return dict(bias=bias, raw_band=raw_key, raw_label=raw_label, exp=exp_, calibrated=bool(table), contrib=contrib,
+                score=score, band=key, label=label, verdict=verdict,
                 parts=parts, weights=WEIGHTS, notes=notes, asof=str(F.index[-1].date()))
