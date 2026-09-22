@@ -912,7 +912,9 @@ def deep(x, side):
             cat = min(cat, 10)
             room = 5 if (o["lo"] or 0) >= 20 else (3 if (o["lo"] or 0) >= 10 else (1 if (o["lo"] or 0) >= 5 else 0))
             if room == 0: flags.append("sitting on its 52-week low — little room")
-            band = (MKT or {}).get("band"); mal = {"red": 3, "amber": 1.5, "green": 0}.get(band, 1.5)
+            # market alignment: the 3-4 week OUTLOOK (calls vs puts), not the squeeze regime
+            ob = ((MKT or {}).get("outlook") or {}).get("band")
+            mal = {"favor_puts": 3, "lean_puts": 2.25, "mixed": 1.5, "lean_calls": 0.75, "favor_calls": 0}.get(ob, 1.5)
             stock_pts = tech + rwp + cat + room + mal
             # option side
             prob = ev = ivv = liq = th = 0
