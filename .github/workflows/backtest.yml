@@ -23,6 +23,8 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Replay the trigger on two years of history
         run: python scanner/backtest.py
+      - name: Score the 3-4 week outlook against forward SPY/IWM returns
+        run: python scanner/outlook_backtest.py
       - name: Publish
         run: |
           if [ -z "$(git status --porcelain data/backtest)" ]; then echo "nothing to publish"; exit 0; fi
