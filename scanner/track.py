@@ -78,7 +78,7 @@ def main():
         px = yf.download(syms, period="3mo", interval="1d", group_by="ticker", auto_adjust=False, threads=True, progress=False)
         tks = {}; per_day = {}
         stats = {name: dict(n=0, hit=0, bust=0, open=0, stock_best=[], opt_ret=[], m10=0, m20=0, m50=0,
-                            c_n=0, c_hit=0, c_bust=0, c_ret=[]) for _, _, name in BUCKETS}
+                            c_n=0, c_hit=0, c_bust=0, c_ret=[], pop=[], in_profit=0, marked=0) for _, _, name in BUCKETS}
         for date, o in picks:
             t = o["t"]; play = o["play"]; entry = entry_price(play); px0 = float(o["px"]); be = float(play.get("be") or 0)
             k = float(play["strike"]); exp = datetime.strptime(play["exp"], "%Y-%m-%d").date()
@@ -126,6 +126,7 @@ def main():
             rec = dict(t=t, side=side, scan=date, score=o.get("score"), px0=px0, entry=entry, exp=play["exp"], strike=k, be=be, mae=mae,
                        fired=((o.get("trig") or {}).get("state") == "fired"), earn_in=bool(o.get("earn_in")), regime=(o.get("mkt")),
                        r5=ret(5), r10=ret(10), r20=ret(20), best=best, be_hit=be_hit, mark=mark, opt_ret=opt_ret, closer=r2,
+                       pop=play.get("pop"), ev=play.get("ev"), delta=play.get("delta"),
                        sessions=int(min(len(cl), 20)), expired=expired, status=status)
             per_day.setdefault(date, []).append(rec)
             if dte_left >= -1 or status != "open": open_all.append(rec)
@@ -135,6 +136,10 @@ def main():
                 for m in (10, 20, 50):                      # measured frequency, not a modelled probability
                     if best >= m: b[f"m{m}"] += 1
             if opt_ret is not None: b["opt_ret"].append(opt_ret)
+            # bear board calibration: what the model said P(profit) was vs how many contracts are actually above entry
+            if play.get("pop") is not None and opt_ret is not None:
+                b["pop"].append(float(play["pop"])); b["marked"] += 1
+                if opt_ret > 0: b["in_profit"] += 1
             if r2:
                 b["c_n"] += 1; b["c_" + r2["status"]] = b.get("c_" + r2["status"], 0) + 1
                 if r2["opt_ret"] is not None: b["c_ret"].append(r2["opt_ret"])
@@ -149,6 +154,7 @@ def main():
                               moved={str(m): dict(n=b[f"m{m}"], pct=round(b[f"m{m}"] / len(b["stock_best"]) * 100) if b["stock_best"] else None) for m in (10, 20, 50)},
                               measured=len(b["stock_best"]),
                               med_opt=round(float(np.median(b["opt_ret"]))) if b["opt_ret"] else None,
+                              calib=(dict(pred=round(float(np.mean(b["pop"]))), real=round(b["in_profit"] / b["marked"] * 100), n=b["marked"]) if b["marked"] else None),
                               closer=dict(n=b["c_n"], hit=b["c_hit"], bust=b["c_bust"],
                                           hit_rate=round(b["c_hit"] / (b["c_hit"] + b["c_bust"]) * 100) if (b["c_hit"] + b["c_bust"]) else None,
                                           med_opt=round(float(np.median(b["c_ret"]))) if b["c_ret"] else None))
