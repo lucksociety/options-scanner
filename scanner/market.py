@@ -20,6 +20,8 @@ from pathlib import Path
 import numpy as np
 import yfinance as yf
 
+import outlook as _outlook
+
 log = logging.getLogger("market")
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -155,6 +157,18 @@ def regime():
                          for k, n in (("spy5", 5), ("spy10", 10))}},
                measured=measured, missing=missing, notes=notes)
     log.info("market regime %s (%s) · %s", score, band, "; ".join(notes))
+    # 3-4 week directional outlook (calls vs puts) — its own download, a year of history for the 50-day math
+    try:
+        h2 = yf.download(_outlook.TICKERS, period="1y", interval="1d", group_by="ticker", auto_adjust=False, threads=True, progress=False)
+        out["outlook"] = _outlook.outlook_today(h2)
+        try:
+            bt = json.load(open(ROOT / "data" / "backtest" / "outlook.json"))
+            out["outlook"]["measured"] = bt.get("bands", {}).get(out["outlook"]["band"]); out["outlook"]["measured_asof"] = bt.get("asof")
+            out["outlook"]["measured_all"] = bt.get("all")
+        except Exception: pass
+        log.info("outlook %s (%s) · %s", out["outlook"]["bias"], out["outlook"]["label"], "; ".join(out["outlook"]["notes"]))
+    except Exception as e:
+        log.error("outlook failed: %s", e); out["outlook"] = None
     return out
 
 
