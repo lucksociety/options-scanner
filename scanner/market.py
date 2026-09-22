@@ -160,11 +160,17 @@ def regime():
     # 3-4 week directional outlook (calls vs puts) — its own download, a year of history for the 50-day math
     try:
         h2 = yf.download(_outlook.TICKERS, period="1y", interval="1d", group_by="ticker", auto_adjust=False, threads=True, progress=False)
-        out["outlook"] = _outlook.outlook_today(h2)
+        try: table = json.load(open(ROOT / "data" / "backtest" / "outlook_model.json"))
+        except Exception: table = None
+        out["outlook"] = _outlook.outlook_today(h2, table)
         try:
             bt = json.load(open(ROOT / "data" / "backtest" / "outlook.json"))
-            out["outlook"]["measured"] = bt.get("bands", {}).get(out["outlook"]["band"]); out["outlook"]["measured_asof"] = bt.get("asof")
-            out["outlook"]["measured_all"] = bt.get("all")
+            o = out["outlook"]; b = o["band"]
+            # held-out (last ~30% of history) odds for today's band are the honest ones; fall back to the full-sample odds
+            o["measured"] = (bt.get("xbands_test", {}).get(b) or bt.get("xbands_all", {}).get(b)) if o.get("calibrated") else bt.get("bands", {}).get(b)
+            o["measured_scope"] = "held-out" if (o.get("calibrated") and bt.get("xbands_test", {}).get(b)) else "all"
+            o["measured_all"] = bt.get("test_all") if o["measured_scope"] == "held-out" else bt.get("all")
+            o["measured_asof"] = bt.get("asof"); o["measured_span"] = [bt.get("first"), bt.get("last")]
         except Exception: pass
         log.info("outlook %s (%s) · %s", out["outlook"]["bias"], out["outlook"]["label"], "; ".join(out["outlook"]["notes"]))
     except Exception as e:
