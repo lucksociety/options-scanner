@@ -39,7 +39,8 @@ BANDS = [(30, "favor_calls", "Favor calls"), (10, "lean_calls", "Lean calls"), (
 PARTS = ("trend", "breadth", "vol", "appetite", "reversion")
 BUCKET = 10                       # component buckets are 10 points wide
 EXP_BANDS = [(0.6, "favor_calls", "Favor calls"), (0.2, "lean_calls", "Lean calls"), (-0.2, "mixed", "Mixed"),
-             (-0.6, "lean_puts", "Lean puts"), (-999, "favor_puts", "Favor puts")]
+             (-0.6, "lean_puts", "Lean puts"), (-999, "favor_puts", "Favor puts")]      # fallback cuts if a table has no quintiles
+BAND_KEYS = [k for _, k, _ in EXP_BANDS]; BAND_LABELS = {k: l for _, k, l in EXP_BANDS}
 
 
 def bucket_key(v):
@@ -59,6 +60,9 @@ def calibrate(F, fwd, shrink=60):
             ex = float(fwd[m].mean()) - base
             t[k] = dict(n=n, excess=round(ex * n / (n + shrink), 3), raw=round(ex, 3), up=round(float((fwd[m] > 0).mean() * 100), 1))
         table["parts"][p] = t
+    # band cut points = quintiles of the expected excess over the fitted history, so each band holds ~20% of sessions
+    e = expected(F, table)
+    table["cuts"] = [round(float(np.percentile(e, q)), 3) for q in (80, 60, 40, 20)]
     return table
 
 
@@ -71,8 +75,13 @@ def expected(F, table):
     return out
 
 
-def exp_band_of(x):
+def exp_band_of(x, cuts=None):
+    """Band from the expected excess return. With `cuts` (from the calibration table) the bands are quintiles of history."""
     if x is None or x != x: return "unknown", "Unknown"
+    if cuts:
+        for c, key in zip(cuts, BAND_KEYS):
+            if x >= c: return key, BAND_LABELS[key]
+        return "favor_puts", "Favor puts"
     for lo, key, label in EXP_BANDS:
         if x >= lo: return key, label
     return "favor_puts", "Favor puts"
@@ -215,7 +224,7 @@ def outlook_today(hist, table=None):
         for p in PARTS:
             b = table["parts"].get(p, {}).get(bucket_key(float(r[p])), {})
             contrib[p] = dict(bucket=bucket_key(float(r[p])), excess=b.get("excess"), up=b.get("up"), n=b.get("n"))
-        key, label = exp_band_of(exp_)
+        key, label = exp_band_of(exp_, table.get("cuts"))
     else:
         key, label = raw_key, raw_label
     notes = []
@@ -230,11 +239,11 @@ def outlook_today(hist, table=None):
     if g("cyc_def20") is not None: notes.append(f"cyclicals vs defensives {g('cyc_def20'):+.1f}pp / 20d")
     if g("rsi") is not None: notes.append(f"SPY RSI {g('rsi', 0):.0f}")
     if bool(r.get("post_panic")): notes.append("post-panic: VIX spiked above 25 and has fallen 20%+")
-    verdict = {"favor_calls": "Tape favors the long side over the next 3–4 weeks: lean on the Calls and Breakout boards.",
-               "lean_calls": "Mild upward tilt over the next 3–4 weeks: calls have the edge, keep puts to the strongest breakdowns.",
-               "mixed": "No directional edge over the next 3–4 weeks: trade the setup, not the market; size smaller both ways.",
-               "lean_puts": "Mild downward tilt over the next 3–4 weeks: puts have the edge, keep calls to fired triggers only.",
-               "favor_puts": "Tape favors the short side over the next 3–4 weeks: lean on the Bear board.",
+    verdict = {"favor_calls": "Strongest fifth of readings: the index's 3–4 week tailwind is at its best here — lean on the Calls and Breakout boards, size normally.",
+               "lean_calls": "Above-average tailwind for the next 3–4 weeks: calls have the edge; puts only on the cleanest breakdowns.",
+               "mixed": "Average tape for the next 3–4 weeks: no market edge either way — trade the setup, not the index.",
+               "lean_puts": "Below-average tailwind: the index helps calls less than usual here — favour fired triggers on the call side, and the Bear board gets more room.",
+               "favor_puts": "Weakest fifth of readings: the index's usual 3–4 week tailwind is largely absent — the best environment this tool has for the Bear board. The index itself still rises more often than not, so puts need a stock-specific breakdown, not a market bet.",
                "unknown": "Outlook data unavailable."}[key]
     parts = {k: g(k, 1) for k in PARTS}
     # score for the dial: calibrated expectation mapped so 0 = -1.5% excess, 50 = 0, 100 = +1.5%; raw bias if uncalibrated
