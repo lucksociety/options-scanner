@@ -164,6 +164,20 @@ def score(D, T, damp=0.55):
     return 1 / (1 + np.exp(-z)), s
 
 
+def calib_map(z, y, bins=20):
+    """Held-out mapping from raw damped log-odds to the ACTUAL hit-rate, by quantile bin: [[z_mean, actual], ...].
+    The live scanner interpolates on this, so the probability on the card is what that score really produced."""
+    q = pd.qcut(z.rank(method="first"), bins, labels=False); out = []
+    for d in range(bins):
+        m = q == d; out.append([round(float(z[m].mean()), 4), round(float(y[m].mean()), 4)])
+    return out
+
+
+def apply_calib(z, cmap):
+    zs = np.array([a for a, _ in cmap]); ys = np.array([b for _, b in cmap])
+    return np.interp(np.asarray(z, dtype=float), zs, ys)
+
+
 def calibrate(p, y, bins=10):
     """Held-out reliability by decile of predicted probability: n, predicted mean, actual hit-rate, avg best20."""
     q = pd.qcut(p.rank(method="first"), bins, labels=False)
@@ -205,8 +219,11 @@ def main():
     dates = sorted(known["date"].unique()); cut = dates[int(len(dates) * 0.7)]
     train, test = known[known["date"] < cut], known[known["date"] >= cut]
     T50 = fit(train, "hit50"); T30 = fit(train, "hit30")
-    p50, _ = score(test, T50); p30, _ = score(test, T30)
+    p50, z50 = score(test, T50); p30, z30 = score(test, T30)
     rel50 = calibrate(p50, test["hit50"]); rel30 = calibrate(p30, test["hit30"])
+    cmap50 = calib_map(z50, test["hit50"]); cmap30 = calib_map(z30, test["hit30"])
+    c50 = pd.Series(apply_calib(z50, cmap50), index=test.index)
+    relc = calibrate(c50, test["hit50"])                                   # reliability AFTER calibration (should sit on the diagonal)
     top = test.assign(p=p50).sort_values("p", ascending=False)
     top_n = {k: dict(n=k, hit50=round(float(top.head(k)["hit50"].mean()) * 100, 1), hit30=round(float(top.head(k)["hit30"].mean()) * 100, 1),
                      med_best=round(float(top.head(k)["best20"].median()), 1)) for k in (100, 300, 1000, 3000)}
@@ -215,8 +232,9 @@ def main():
     model = dict(asof=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
                  names=int(D["t"].nunique()), rows=int(len(known)), first=str(dates[0])[:10], last=str(dates[-1])[:10], split=str(cut)[:10],
                  base50=A50["base"], base30=A30["base"], edges=EDGES, flags=FLAGS, inter={k: [list(v[0]), list(v[1])] for k, v in INTER.items()},
-                 t50=A50, t30=A30, heldout=dict(n=int(len(test)), base50=round(float(test["hit50"].mean()), 5), base30=round(float(test["hit30"].mean()), 5),
-                                                 rel50=rel50, rel30=rel30, top=top_n),
+                 t50=A50, t30=A30, calib50=cmap50, calib30=cmap30,
+                 heldout=dict(n=int(len(test)), base50=round(float(test["hit50"].mean()), 5), base30=round(float(test["hit30"].mean()), 5),
+                              rel50=rel50, rel30=rel30, relc50=relc, top=top_n),
                  caveat="Today's universe replayed backwards (survivorship-biased) with today's short interest / float applied to every past day (no free SI history). Entry = next day's open.")
     json.dump(model, open(OUT / "squeeze_model.json", "w"), separators=(",", ":"))
     known.sample(min(20000, len(known)), random_state=1).round(3).to_csv(OUT / "squeeze_rows.csv", index=False)
