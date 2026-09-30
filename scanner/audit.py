@@ -131,7 +131,7 @@ def main():
              ours_top16=sum(1 for m in movers if any(v.get("where") == "top16" for v in m["ours"].values())),
              rows=movers)
     json.dump(S, open(OUT / "misses.json", "w"), separators=(",", ":"))
-    flat = [dict(t=m["t"], day1=m["day1"], gain5=m["gain5"], sf=m.get("sf"), flt=m.get("flt"), optionable=m.get("optionable"),
+    flat = [dict(t=m["t"], date=m["day1"], gain5=m["gain5"], sf=m.get("sf"), flt=m.get("flt"), optionable=m.get("optionable"),
                  calls=m["ours"]["calls"].get("where"), calls_score=m["ours"]["calls"].get("score"),
                  brk=m["ours"]["breakout"].get("where"), **m["pre"]) for m in movers]
     pd.DataFrame(flat).to_csv(OUT / "misses.csv", index=False)
