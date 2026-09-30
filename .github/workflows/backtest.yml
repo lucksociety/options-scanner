@@ -25,6 +25,8 @@ jobs:
         run: python scanner/backtest.py
       - name: Score the 3-4 week outlook against forward SPY/IWM returns
         run: python scanner/outlook_backtest.py
+      - name: Fit the squeeze model (P of +50% in 20 sessions) and test it out of sample
+        run: python scanner/squeeze_model.py
       - name: Publish
         run: |
           if [ -z "$(git status --porcelain data/backtest)" ]; then echo "nothing to publish"; exit 0; fi
