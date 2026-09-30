@@ -13,10 +13,6 @@ on:
         type: choice
         default: brief
         options: [brief, score]
-      force:
-        description: "run the brief even outside 07:00–09:25 ET (testing)"
-        type: boolean
-        default: false
 
 concurrency:
   group: scan
@@ -46,7 +42,7 @@ jobs:
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          MORNING_FORCE: ${{ inputs.force && '1' || '0' }}
+          MORNING_FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}   # any manual run is intentional
         run: |
           rc=0; python scanner/morning.py "${{ steps.mode.outputs.mode }}" || rc=$?
           if [ "$rc" = "3" ]; then echo "nothing to do"; exit 0; fi
