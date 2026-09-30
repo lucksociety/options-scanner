@@ -1,0 +1,37 @@
+name: Luck Society Miss Audit
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: audit
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Which names squeezed, and did we have them
+        run: python scanner/audit.py
+      - name: Publish
+        run: |
+          git config user.name "luck-society-scanner-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/audit
+          git commit -q -m "audit: $(date -u '+%F %H:%M') UTC" || { echo "nothing to publish"; exit 0; }
+          for i in 1 2 3 4 5; do
+            if git pull -q --rebase -X theirs && git push -q; then echo "published on attempt $i"; exit 0; fi
+            git rebase --abort 2>/dev/null || true
+            sleep $((RANDOM % 10 + 5))
+          done
+          echo "could not publish"; exit 1
