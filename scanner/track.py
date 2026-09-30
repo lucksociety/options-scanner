@@ -29,12 +29,17 @@ ROOT = Path(__file__).resolve().parent.parent; DATA = ROOT / "data"; OUT = DATA 
 LOOKBACK_DAYS = 45
 SIDES = ("calls", "puts", "breakout")
 
-BUCKETS = [(0, 50, "<50"), (50, 60, "50-59"), (60, 70, "60-69"), (70, 101, "70+")]
+BUCKETS_PUTS = [(0, 50, "<50"), (50, 60, "50-59"), (60, 70, "60-69"), (70, 101, "70+")]
+# calls/breakout picks are ranked by the squeeze model's calibrated P(+50%), so their buckets are probability bands
+BUCKETS_MODEL = [(0, 10, "<10"), (10, 20, "10-19"), (20, 30, "20-29"), (30, 101, "30+")]
 
-def bucket(sc):
-    for lo, hi, name in BUCKETS:
+def buckets_for(side): return BUCKETS_PUTS if side == "puts" else BUCKETS_MODEL
+
+def bucket(sc, side="puts"):
+    B = buckets_for(side)
+    for lo, hi, name in B:
         if lo <= sc < hi: return name
-    return "<50"
+    return B[0][2]
 
 def load_history(side):
     d = DATA / ("history" if side == "calls" else f"{side}/history")
@@ -78,7 +83,7 @@ def main():
         px = yf.download(syms, period="3mo", interval="1d", group_by="ticker", auto_adjust=False, threads=True, progress=False)
         tks = {}; per_day = {}
         stats = {name: dict(n=0, hit=0, bust=0, open=0, stock_best=[], opt_ret=[], m10=0, m20=0, m50=0,
-                            c_n=0, c_hit=0, c_bust=0, c_ret=[], pop=[], in_profit=0, marked=0) for _, _, name in BUCKETS}
+                            c_n=0, c_hit=0, c_bust=0, c_ret=[], pop=[], in_profit=0, marked=0) for _, _, name in buckets_for(side)}
         for date, o in picks:
             t = o["t"]; play = o["play"]; entry = entry_price(play); px0 = float(o["px"]); be = float(play.get("be") or 0)
             k = float(play["strike"]); exp = datetime.strptime(play["exp"], "%Y-%m-%d").date()
@@ -130,7 +135,7 @@ def main():
                        sessions=int(min(len(cl), 20)), expired=expired, status=status)
             per_day.setdefault(date, []).append(rec)
             if dte_left >= -1 or status != "open": open_all.append(rec)
-            b = stats[bucket(float(o.get("score") or 0))]; b["n"] += 1; b[status] += 1
+            b = stats[bucket(float(o.get("score") or 0), side)]; b["n"] += 1; b[status] += 1
             if best is not None:
                 b["stock_best"].append(best)
                 for m in (10, 20, 50):                      # measured frequency, not a modelled probability
