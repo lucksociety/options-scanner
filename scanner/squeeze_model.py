@@ -106,15 +106,31 @@ def bucket(name, v):
     return f">={e[-1]}"
 
 
-def inter_key(name, row):
+def bucket_series(name, series):
+    """Vectorised bucket() for a whole column."""
+    if name in FLAGS: return series.fillna(0).astype(bool).map({True: "1", False: "0"})
+    e = EDGES[name]; labels = [f"<{e[0]}"] + [f"{e[i-1]}..{e[i]}" for i in range(1, len(e))] + [f">={e[-1]}"]
+    idx = np.searchsorted(np.asarray(e, dtype=float), series.to_numpy(dtype=float), side="right")
+    out = pd.Series(np.array(labels)[idx], index=series.index); out[series.isna()] = "na"
+    return out
+
+
+def _cut(series, edges):
+    """Vectorised bucket index as strings: None edges = boolean flag, else np.searchsorted; NaN -> 'na'."""
+    if edges is None: return series.fillna(0).astype(bool).map({True: "1", False: "0"})
+    idx = np.searchsorted(np.asarray(edges, dtype=float), series.to_numpy(dtype=float), side="right")
+    out = pd.Series(idx.astype(str), index=series.index); out[series.isna()] = "na"
+    return out
+
+
+def inter_keys(name, D):
     (a, ea), (b, eb) = INTER[name]
-    def cut(v, edges):
-        if edges is None: return "1" if v else "0"
-        if v != v: return "na"
-        for i, x in enumerate(edges):
-            if v < x: return str(i)
-        return str(len(edges))
-    return f"{cut(row[a], ea)}|{cut(row[b], eb)}"
+    return _cut(D[a], ea) + "|" + _cut(D[b], eb)
+
+
+def inter_key(name, row):
+    """Single-row version (the live scanner scores one name at a time)."""
+    return inter_keys(name, pd.DataFrame([row])).iloc[0]
 
 
 def fit(D, target="hit50", shrink=150):
@@ -123,13 +139,13 @@ def fit(D, target="hit50", shrink=150):
     def lo(p, n):
         p = min(max(p, 1e-4), 1 - 1e-4); return math.log(p / (1 - p)) - math.log(base / (1 - base)), n
     for f in list(EDGES) + FLAGS:
-        keys = D[f].map(lambda v: bucket(f, v)); t = {}
+        keys = bucket_series(f, D[f]); t = {}
         for k, g in D.groupby(keys)[target]:
             n = int(g.count()); p = float(g.mean()) if n else base
             l, _ = lo(p, n); t[k] = dict(n=n, p=round(p, 4), w=round(l * n / (n + shrink), 4))
         T["feats"][f] = t
     for name in INTER:
-        keys = D.apply(lambda r: inter_key(name, r), axis=1); t = {}
+        keys = inter_keys(name, D); t = {}
         for k, g in D.groupby(keys)[target]:
             n = int(g.count()); p = float(g.mean()) if n else base
             l, _ = lo(p, n); t[k] = dict(n=n, p=round(p, 4), w=round(l * n / (n + shrink), 4))
@@ -141,9 +157,9 @@ def score(D, T, damp=0.55):
     """Sum of bucket log-odds (damped, because the features are correlated), back to a probability."""
     base = T["base"]; s = pd.Series(0.0, index=D.index)
     for f, t in T["feats"].items():
-        s += D[f].map(lambda v: t.get(bucket(f, v), {}).get("w", 0.0))
+        s += bucket_series(f, D[f]).map(lambda k: t.get(k, {}).get("w", 0.0))
     for name, t in T["inter"].items():
-        s += D.apply(lambda r: t.get(inter_key(name, r), {}).get("w", 0.0), axis=1)
+        s += inter_keys(name, D).map(lambda k: t.get(k, {}).get("w", 0.0))
     z = math.log(base / (1 - base)) + damp * s
     return 1 / (1 + np.exp(-z)), s
 
