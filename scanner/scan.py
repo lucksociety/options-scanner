@@ -31,6 +31,7 @@ from yfinance import EquityQuery as EQ
 
 from market import regime
 import bear
+import engine
 
 log = logging.getLogger("scan")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -45,10 +46,12 @@ SIDES = ("calls", "puts", "breakout")
 MKT = None          # market regime, scored once per run (scanner/market.py)
 
 CFG = {
-    "calls": dict(price_min=1.0, price_max=10.0, si_min=15.0, avgvol_min=300_000, dv_min=1.0, deep_n=40,   # dv_min = $M traded a day
+    # v2: the whole $1-10 band, optionable, ranked by the squeeze model's calibrated P(+50% in 20 sessions). No short-interest
+    # gate — the miss audit showed SI >= 15% excluded 81% of the names that actually squeezed; SI is a model feature instead.
+    "calls": dict(price_min=1.0, price_max=10.0, avgvol_min=300_000, dv_min=0.7, deep_n=40,
                   min_dte=14, max_dte=45, max_ask=0.25, min_oi=25, max_be=60.0),
-    # same universe as calls (heavily shorted and cheap) but timed off momentum instead of a bottom
-    "breakout": dict(price_min=1.0, price_max=10.0, si_min=15.0, avgvol_min=300_000, dv_min=1.0, deep_n=40,
+    # same ranking, restricted to names whose trigger pattern is present today (fired or armed): ignition in progress
+    "breakout": dict(price_min=1.0, price_max=10.0, avgvol_min=300_000, dv_min=0.7, deep_n=40,
                      min_dte=14, max_dte=45, max_ask=0.35, min_oi=25, max_be=60.0),
     # Bear board: liquid $5-35 names with bearish structure and relative weakness; contract chosen on modelled
     # probability / expected value (scanner/bear.py). $35 is where a 0.35-0.55 delta put stops fitting under $1.00.
@@ -374,92 +377,24 @@ def premarket(info):
     if p and prev: return round(float(p), 2), round((float(p) / float(prev) - 1) * 100, 1)
     return None
 
-# --------------------------------------------------------------------------- stage 1 · calls
+# --------------------------------------------------------------------------- stage 1 · calls / breakout (squeeze engine v2)
+_V2 = {}
 def stage1_calls(kind="calls"):
-    """One screen, two rankings: 'calls' wants the shorted names that have stopped falling,
-    'breakout' wants the shorted names that have already turned and are pressing highs."""
-    c = CFG[kind]
-    q = EQ("and", [EQ("gt", ["short_percentage_of_float.value", c["si_min"]]),
-                   EQ("btwn", ["intradayprice", c["price_min"], c["price_max"]]),
-                   EQ("gt", ["avgdailyvol3m", c["avgvol_min"]]), EQ("eq", ["region", "us"])])
-    quotes = screen(q, "short_percentage_of_float.value"); syms = [x["symbol"] for x in quotes]
-    log.info("%s screener: %d names", kind, len(syms))
-    if not syms: raise RuntimeError("screener returned nothing")
-    hist = batch_history(syms); rows = []
-    for x in quotes:
-        t = x["symbol"]
-        try:
-            h = frame_for(hist, t, len(syms))
-            if len(h) < 60: continue
-            cl = h["Close"].to_numpy(); vol = h["Volume"].to_numpy(); p = float(cl[-1])
-            perf = lambda n: round((p / float(cl[-1 - n]) - 1) * 100, 2) if len(cl) > n else None
-            sma = lambda n: round((p / float(cl[-n:].mean()) - 1) * 100, 2) if len(cl) >= n else None
-            rs = rsi_series(cl[-60:]); av = float(vol[-63:].mean()); hvp = hv_percentile(cl)
-            av10 = float(vol[-10:].mean()); hi_ = h["High"].to_numpy(); lo_ = h["Low"].to_numpy()
-            tr = np.maximum(hi_[-15:] - lo_[-15:], np.maximum(abs(hi_[-15:] - cl[-16:-1]), abs(lo_[-15:] - cl[-16:-1])))
-            rows.append(dict(t=t, co=x.get("longName") or x.get("shortName") or t, mc=x.get("marketCap"), sf=0.0, sr=0.0,
-                             pw=perf(5), pm=perf(21), pq=perf(63), s20=sma(20), s50=sma(50), s200=sma(200),
-                             hi=round((p / float(cl[-252:].max()) - 1) * 100, 2), lo=round((p / float(cl[-252:].min()) - 1) * 100, 2),
-                             h20=round((p / float(hi_[-20:].max()) - 1) * 100, 2), h50=round((p / float(hi_[-50:].max()) - 1) * 100, 2),
-                             atr=round(float(tr.mean()) / p * 100, 2),                       # ATR(14) as % of price: how big a normal day is
-                             dv=round(av * p / 1e6, 2),                                       # average daily dollar volume, $M
-                             rv10=round(float(vol[-1]) / (av10 or 1), 2),
-                             rsi=round(float(rs[-1]), 2), av=av, rv=round(float(vol[-1]) / (av or 1), 2), p=round(p, 2), earn="-",
-                             hvp=hvp[0] if hvp else None, hv=hvp[1] if hvp else None, earn_ts=None))
-        except Exception as e: log.warning("%s stage1 %s: %s", kind, t, e)
-    for r in rows:
-        try:
-            info = yf.Ticker(r["t"]).info
-            r["sf"] = round(float(info.get("shortPercentOfFloat") or 0) * 100, 2); r["sr"] = round(float(info.get("shortRatio") or 0), 2)
-            r["earn"] = earn_label(info); r["earn_ts"] = info.get("earningsTimestampStart") or info.get("earningsTimestamp")
-            key_stats(info, r)
-        except Exception as e: log.warning("info %s: %s", r["t"], e)
-        time.sleep(0.15)
-    keep = [x for x in rows if x["av"] >= c["avgvol_min"] and x["sf"] >= c["si_min"] and (x.get("dv") or 0) >= c.get("dv_min", 0)]
-    for x in keep:
-        x["ftd"] = on_threshold(x["t"], x.get("exch"))
-        # Squeeze fuel is scored here too, not only after the cut: otherwise a 15M-float name at 30% short
-        # loses its deep-scan slot to a 300M-float name at 35% and the float weight never gets a say.
-        s = min(x["sf"], 60) / 60 * 30 + min(x["sr"] or 0, 10) / 10 * 8 + float_pts(x.get("flt"))[0]
-        sir = x.get("si_rep")
-        if sir is not None: s += 4 if sir >= 25 else (2 if sir >= 10 else 0)
-        if x.get("ftd"): s += 3
-        if kind == "calls":                                   # bottoming: beaten down, starting to turn
-            if 25 <= x["rsi"] <= 45: s += 15
-            elif 45 < x["rsi"] <= 55: s += 8
-            elif x["rsi"] < 25: s += 5
-            if x["lo"] <= 25: s += 15
-            elif x["lo"] <= 50: s += 8
-            if (x["pq"] or 0) < -20: s += 8
-            if (x["pw"] or 0) > -3: s += 6
-            if (x["s20"] or 0) > 0: s += 6
-            if x["rv"] >= 1.2: s += 5
-        else:                                                 # breakout: already moving, pressing highs
-            if 55 <= x["rsi"] <= 72: s += 15
-            elif 45 <= x["rsi"] < 55: s += 8
-            elif x["rsi"] > 72: s += 3
-            if (x["hi"] if x["hi"] is not None else -100) >= -15: s += 12
-            elif (x["hi"] if x["hi"] is not None else -100) >= -30: s += 6
-            if (x["s20"] or 0) > 0: s += 8
-            if (x["s50"] or 0) > 0: s += 6
-            if (x["pw"] or 0) > 3: s += 6
-            if x["rv"] >= 1.5: s += 8
-            elif x["rv"] >= 1.2: s += 4
-        x["s1"] = round(s, 1)
-    keep.sort(key=lambda x: -x["s1"])
-    top = []
-    for x in keep:
-        if len(top) >= c["deep_n"]: break
-        if has_options(x["t"]): top.append(x)
-        time.sleep(0.1)
-    for x in top:
-        x["borrow"] = borrow_info(x["t"]); time.sleep(0.2)
-        x["dil"], x["k8"] = edgar_recent(x["t"])
-        x["shrg"] = share_growth(x["t"])
-        x["att"] = attention(x["t"]); x["att_z"], x["att_mu"] = zscore("att", x["t"], x["att"]); time.sleep(0.3)
-    log.info("%s stage1: universe=%d pass=%d deep=%d · borrow %d/%d, filings %d/%d", kind, len(rows), len(keep), len(top),
-             sum(1 for x in top if x.get("borrow")), len(top), sum(1 for x in top if x.get("dil") is not None), len(top))
-    return len(rows), len(keep), top
+    """Both call boards share one engine pass per run: broad universe -> optionable -> model probability -> top deep_n.
+    The breakout board is the same ranking filtered (after the deep scan) to names with a live trigger pattern."""
+    if "res" not in _V2:
+        model = engine.load_model()
+        if not model: raise RuntimeError("squeeze model missing: run the backtest workflow first")
+        universe, scored, top, rest = engine.stage1(CFG["calls"], model, deep_n=max(CFG["calls"]["deep_n"], 48))
+        for x in top:
+            x["ftd"] = on_threshold(x["t"], x.get("exch"))
+            x["borrow"] = borrow_info(x["t"]); time.sleep(0.15)
+            x["dil"], x["k8"] = None, None
+            x["shrg"] = share_growth(x["t"])
+            x["att"] = attention(x["t"]); x["att_z"], x["att_mu"] = zscore("att", x["t"], x["att"]); time.sleep(0.2)
+        _V2["res"] = (universe, scored, top); _V2["rest"] = rest; _V2["model"] = model
+        log.info("v2 stage1: universe=%d scored=%d deep=%d · top: %s", universe, scored, len(top), ", ".join(f"{x['t']} {x['p50']}%" for x in top[:6]))
+    return _V2["res"]
 
 # --------------------------------------------------------------------------- stage 1 · puts (bear board)
 def bench_windows(hist, n_syms):
@@ -782,106 +717,37 @@ def deep(x, side):
             o["earn_in"] = datetime.now(timezone.utc).date() <= ed <= ex
         b = x.get("borrow") or {}
         if side in ("calls", "breakout"):
+            # ---- v2: the ranking IS the model. The card keeps the fuel facts (borrow, float, SI trend, threshold list) as
+            # context, and the trigger tells you whether ignition has started today.
             o["rsiUp"] = o["rsi"] > o["rsi3"]; o["wasOversold"] = min(rs[-10:]) < 35
             o["low20"] = round(float(cl[-1] / cl[-20:].min() - 1) * 100, 1)
             fpts, fm = float_pts(x.get("flt")); o["fltm"] = fm
-            fuel = clamp(o["sf"] or 0, 0, 60) / 60 * 15 + fpts + clamp(o["sr"] or 0, 0, 10) / 10 * 6   # 0-29
-            if b.get("fee") is not None:
-                fuel += 4 if b["fee"] >= 50 else (3 if b["fee"] >= 20 else (1 if b["fee"] >= 5 else 0))
-                fuel += 2 if b["avail"] < 100_000 else (1 if b["avail"] < 500_000 else 0)
-            else:
-                fuel *= 35 / 29            # no borrow feed: rescale rather than strand 6 pts for everyone
-            # trend beats level: shorts piling in, or borrow getting expensive, is the actual tell.
-            # Our own SI log only moves when the exchange report does, so it is NOT scored (that would count
-            # the same event twice with si_rep below); it is logged for the card. Borrow fee/availability
-            # are daily data, so their 30-day change is real information.
             o["si_chg"] = log_metric("si", x["t"], o.get("sf"))
             o["fee_chg"] = log_metric("fee", x["t"], b.get("fee"))
             o["avail_chg"] = log_metric("avail", x["t"], b.get("avail"))
-            if (o["fee_chg"] or 0) >= 5: fuel += 2
-            if b.get("avail") and o["avail_chg"] is not None and o["avail_chg"] <= -0.5 * (b["avail"] - o["avail_chg"]): fuel += 1   # shares to borrow halved
-            sir = x.get("si_rep")                              # exchange-reported change between the last two settlement dates
-            if sir is not None: fuel += 3 if sir >= 25 else (2 if sir >= 10 else 0)
-            if x.get("ftd"): fuel += 2                         # Reg SHO threshold list = persistent failures to deliver
-            if (x.get("inst") or 0) >= 40: fuel += 2           # institutions sit on it: the effective tradable float is smaller still
-            fuel = min(fuel, 35)
-            # Ignition inputs shared by both call boards
             bench = (MKT or {}).get("bench") or {}
             o["rs5"] = round(float(cl[-1] / cl[-6] - 1) * 100 - (bench.get("iwm5") or 0), 1) if len(cl) > 6 and bench.get("iwm5") is not None else None
             o["rs10"] = round(float(cl[-1] / cl[-11] - 1) * 100 - (bench.get("iwm10") or 0), 1) if len(cl) > 11 and bench.get("iwm10") is not None else None
-            rng = float(hi[-1] - lo[-1]); o["clpos"] = round(float(cl[-1] - lo[-1]) / rng, 2) if rng > 0 else None     # where today closed in its range
+            rng = float(hi[-1] - lo[-1]); o["clpos"] = round(float(cl[-1] - lo[-1]) / rng, 2) if rng > 0 else None
             o["sma20_up"] = bool(len(cl) >= 25 and cl[-20:].mean() > cl[-25:-5].mean())
-            att_z = x.get("att_z"); apts = 3 if (att_z or 0) >= 2 else (1 if (att_z or 0) >= 1 else 0)
-            if apts: flags.append(f"attention {x.get('att')} posts/24h vs {x.get('att_mu')} avg")
+            o["high20"] = round(float(cl[-1] / hi[-20:].max() - 1) * 100, 1)
             gpts, gflags = gamma_pts(o.get("gam")); flags += gflags
-            if side == "calls":
-                bot = 0
-                if 25 <= o["rsi"] <= 45: bot += 10
-                elif o["rsi"] < 25 or o["rsi"] <= 52: bot += 4
-                if o["rsiUp"]: bot += 10
-                if o["wasOversold"]: bot += 5
-                if o["low20"] <= 8 or (o["lo"] is not None and o["lo"] <= 15): bot += 5
-                if o["vr"] >= 1.3: bot += 5
-                if o["pm_chg"] is not None and 2 <= o["pm_chg"] <= 15: bot += 3
-                if (o["rs5"] or 0) > 0: bot += 2                                        # already outperforming small caps off the low
-                bot = min(bot + gpts + apts, 35)
-                setup = fuel + bot - (5 if o["up3d"] < -10 else 0)
-                if o["up3d"] < -10: flags.append(f"still falling ({o['up3d']}% / 3d)")
-                if o["rsiUp"]: flags.append("RSI turning up")
-            else:
-                # Breakout timing: the trend has already turned — structure, location and volume, not oversold bounce.
-                o["hh"] = bool(hi[-10:].max() > hi[-20:-10].max() and lo[-10:].min() > lo[-20:-10].min())
-                s20v = float(cl[-20:].mean()); s50v = float(cl[-50:].mean()) if len(cl) >= 50 else s20v
-                o["above20"] = bool(cl[-1] > s20v); o["stack"] = bool(cl[-1] > s20v > s50v)
-                o["high20"] = round(float(cl[-1] / hi[-20:].max() - 1) * 100, 1)                 # % below 20-day high (≤ 0)
-                w1 = float(hi[-10:].max() - lo[-10:].min())
-                w0 = float(hi[-30:-10].max() - lo[-30:-10].min()) if len(cl) >= 30 else 0.0
-                o["coil"] = bool(w0 and w1 / w0 < 0.6)                                           # range compressing under resistance
-                o["recl50"] = bool(len(cl) >= 55 and cl[-1] > s50v and float(min(cl[-5:])) <= float(cl[-55:-5].mean()) * 1.02)
-                brk = 0
-                if o["hh"]: brk += 6
-                if o["stack"]: brk += 6
-                elif o["above20"]: brk += 3
-                if o["high20"] >= -3: brk += 8
-                elif o["high20"] >= -8: brk += 4
-                if o["coil"]: brk += 5
-                if o["recl50"]: brk += 4
-                if o["vr"] >= 2: brk += 8
-                elif o["vr"] >= 1.3: brk += 5
-                if 50 <= o["rsi"] <= 72: brk += 4
-                elif o["rsi"] > 78: brk -= 3
-                if o["pm_chg"] is not None and 1 <= o["pm_chg"] <= 12: brk += 3
-                if (o["rs5"] or 0) > 5: brk += 3                                         # relative strength vs IWM, not just up
-                if (o["rs10"] or 0) > 8: brk += 3
-                if o["clpos"] is not None and o["clpos"] >= 0.8: brk += 2                # closed in the top fifth of its range
-                if o["sma20_up"]: brk += 2
-                bot = min(max(brk, 0) + gpts + apts, 35)
-                setup = fuel + bot - (6 if o["up3d"] > 25 else 0)          # chasing something already vertical is how you buy the top
-                if o["up3d"] > 25: flags.append(f"already vertical (+{o['up3d']}% / 3d)")
-                if o["hh"]: flags.append("higher highs and lows")
-                if o["high20"] >= -3: flags.append("at 20-day high")
-                elif o["high20"] >= -8: flags.append(f"{abs(o['high20'])}% under 20-day high")
-                if o["coil"]: flags.append("coiling under resistance")
-                if o["recl50"]: flags.append("reclaimed 50-day")
-                if o["stack"]: flags.append("above 20 & 50-day")
-                if (o["rs5"] or 0) > 5: flags.append(f"+{o['rs5']}pp vs IWM / 5d")
-                if o["clpos"] is not None and o["clpos"] >= 0.8: flags.append("closed near the high")
-            if o["vr"] >= 1.3: flags.append(f"volume pickup {o['vr']}x")
+            att_z = x.get("att_z")
+            if (att_z or 0) >= 1: flags.append(f"attention {x.get('att')} posts/24h vs {x.get('att_mu')} avg")
+            why = x.get("why") or {}
+            for w in (why.get("pos") or [])[:3]: flags.append(f"{w['label']} {w['bucket']} · {w['p']}% hit +50%")
+            for w in (why.get("neg") or [])[:1]: flags.append(f"{w['label']} {w['bucket']} · only {w['p']}% hit +50%")
             if b.get("fee") is not None and b["fee"] >= 20: flags.append(f"borrow fee {b['fee']}%")
             if b.get("avail") is not None and b["avail"] < 100_000: flags.append(f"{b['avail']:,} shares to borrow")
             if o.get("fltm") is not None and o["fltm"] < 25: flags.append(f"{o['fltm']}M float")
-            if (o.get("si_chg") or 0) >= 2: flags.append(f"short interest +{o['si_chg']}pp")
-            if (o.get("fee_chg") or 0) >= 5: flags.append(f"borrow fee +{o['fee_chg']}pp")
             if (x.get("si_rep") or 0) >= 10: flags.append(f"shorts added {x['si_rep']}% since {x.get('ssp_date') or 'last report'}")
             if x.get("ftd"): flags.append("Reg SHO threshold list")
-            # Dilution is the squeeze killer: a company that sells stock into every rally caps the move. Graded, not a nudge.
             g = x.get("shrg") or 0
-            if g >= 50: setup -= 12; flags.append(f"heavy dilution: shares +{g}% in 6mo")
-            elif g >= 25: setup -= 8; flags.append(f"dilution: shares +{g}% in 6mo")
-            elif g >= 10: setup -= 4; flags.append(f"shares +{g}% in 6mo")
-            if o.get("avail_chg") is not None and b.get("avail") and o["avail_chg"] < 0 and -o["avail_chg"] >= 0.5 * (b["avail"] - o["avail_chg"]):
-                flags.append("shares to borrow halved in 30d")
-            o.update(fuel=round(fuel, 1), bot=bot)
+            if g >= 25: flags.append(f"dilution: shares +{g}% in 6mo")
+            if o["up3d"] > 25: flags.append(f"already vertical (+{o['up3d']}% / 3d) — the model likes it, the fill won't")
+            o["p50"] = x.get("p50"); o["p30"] = x.get("p30"); o["why"] = why; o["feat"] = x.get("feat")
+            setup = o["p50"] or 0                                  # the score is the calibrated probability, in points
+            o.update(fuel=round(o["p30"] or 0, 1), bot=round(o["p50"] or 0, 1))
         else:
             # ---- Bear board: the playbook's 100-point sheet. Stock side (43): technical 15, relative weakness 10,
             # catalyst 10, room to support 5, market alignment 3. Option side (57): downside probability 20,
@@ -975,17 +841,14 @@ def deep(x, side):
         if side == "puts":
             s = clamp(setup, 0, 100)          # the bear sheet is already out of 100 and carries its own market-alignment line
         else:
-            s = clamp(setup, 0, 70) / 70 * 100
-            # The tape gets 15% of the score: the same setup is worth less when shorts are being paid.
-            if mk is not None: s = 0.85 * s + 0.15 * mk
-        if o.get("trig") and o["trig"]["state"] == "fired" and s < 60:
-            # the backtest did not test the setup score, so the bar is a sanity floor, not a calibrated cut
-            o["trig"]["state"] = "armed"; o["trig"]["why"].append(f"score {round(s)} under the 60 floor")
+            s = clamp(setup, 0, 100)          # v2: the calibrated P(+50% within 20 sessions), in percentage points
+        if o.get("trig") and o["trig"]["state"] == "fired" and side != "puts" and s < 10:
+            o["trig"]["state"] = "armed"; o["trig"]["why"].append(f"model gives it only {round(s)}% — below the base rate")
             ti = next((i for i, f in enumerate(flags) if f.startswith("TRIGGERED")), None)
-            if ti is not None: flags[ti] = f"{o['trig']['kind']} on volume, but setup score {round(s)} is under the 60 floor"
-        o.update(flags=flags, setup=round(clamp(setup, 0, 100 if side == "puts" else 70), 1), opt=round(opt, 1),
-                 score=round(s if o["play"] else min(s, 40), 1),
-                 pot=None if side == "puts" else round(o["fuel"] / 35 * 100), imm=None if side == "puts" else round(o["bot"] / 35 * 100))   # how explosive vs. is it starting now
+            if ti is not None: flags[ti] = f"{o['trig']['kind']} on volume, but the model gives it only {round(s)}%"
+        o.update(flags=flags, setup=round(clamp(setup, 0, 100), 1), opt=round(opt, 1),
+                 score=round(s if o["play"] else min(s, s * 0.5), 1),
+                 pot=None if side == "puts" else o.get("p30"), imm=None if side == "puts" else o.get("p50"))
     except Exception as e:
         log.warning("%s: %s", x["t"], e); o["err"] = str(e)[:120]; o["score"] = -1
     return o
@@ -1011,10 +874,12 @@ def assemble(side, mode, universe, pass1, top_in, deep_out, full_asof):
     keys = ("t","co","px","sf","sr","rsi","rsi3","lo","hi","low20","high20","up3d","vr","pq","pm","pw","p10","s20","av","mc","earn",
             "runway","dil","ipo_days","gapfail","borrow","k8","shrg","flt","fltm","ins","si_date","si_chg","fee_chg","avail_chg","gam","mkt","exch","sf_src","att","att_z","att_mu","rs5","rs10","clpos","sma20_up","pot","imm","trig","inst","ss","ssp","ssp_date","si_rep","ftd","atr","dv","rv10","h20","h50","hh","stack","coil","recl50","pm_px","pm_chg","iv_rank","ivr_src","atm_iv","earn_in",
             "fuel","bot","opt","setup","score","flags","play","play2","dud","alts","closes","err",
-            "tech","struct","rwp","rs1_spy","rs3_spy","rs5_spy","rs10_spy","rs20_spy","rs10_qqq","rs20_qqq","model","sheet","rk")
+            "tech","struct","rwp","rs1_spy","rs3_spy","rs5_spy","rs10_spy","rs20_spy","rs10_qqq","rs20_qqq","model","sheet","rk",
+            "p50","p30","why","feat","z50")
     top = [{k: o.get(k) for k in keys} for o in deep_out[:16]]
     for o in top: o["lo52"] = o.pop("lo"); o["hi52"] = o.pop("hi")
     rest = [[o["t"], o.get("px"), o.get("sf"), o.get("rsi"), o.get("score"), 1 if o.get("play") else 0] for o in deep_out[16:]]
+    if side != "puts": rest += [r for r in _V2.get("rest", []) if r[0] not in {o["t"] for o in deep_out}]   # next names by model probability, not deep-scanned
     return _clean(dict(side=side, asof=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
                        full_asof=full_asof, mode=mode, universe=universe, pass1=pass1, deep=len(deep_out), market=MKT,
                        stage1=top_in, top=top, rest=rest, cfg=CFG[side]))
@@ -1036,7 +901,12 @@ def run_side(side, mode, now_et):
         full_asof = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     else:
         universe, pass1, top, full_asof = prev["universe"], prev["pass1"], prev["stage1"], prev.get("full_asof")
-    out = assemble(side, mode, universe, pass1, top, stage2(top, side), full_asof)
+    deep_out = stage2(top, side)
+    if side == "breakout":
+        # ignition in progress: a trigger pattern today (fired or armed). Names without one drop to the watchlist.
+        live = [o for o in deep_out if (o.get("trig") or {}).get("kind")]; idle = [o for o in deep_out if not (o.get("trig") or {}).get("kind")]
+        deep_out = live + idle if len(live) >= 4 else deep_out
+    out = assemble(side, mode, universe, pass1, top, deep_out, full_asof)
     json.dump(out, open(data / "latest.json", "w"), separators=(",", ":"))
     if mode == "full":
         json.dump(out, open(data / "history" / f"{today}.json", "w"), separators=(",", ":"))
